@@ -80,6 +80,11 @@ on the restore node itself; in `ssh` mode it uses
 - `qm set` is run as `qm set <vmid> --<k> <v> ... --delete k1,k2`, every
   argument shlex-quoted for the remote shell. A non-zero exit →
   `PbvError(code="NODE_SHELL_FAIL")` with the last stderr line (≤ 200 chars).
+- `pbv.pve.NodeShellRunner(cfg: NodeShellConfig, *, run=subprocess.run, which=shutil.which)`
+  implements NodeShell plus `probe() -> str` (raises `PbvError(code="NODE_SHELL_FAIL")`), used by preflight.
+  `ConsoleCapture(shell: NodeShell)` adapts it to `ConsoleCapturer`; `ConsoleCapture.from_config(shell, shot)`
+  returns None unless `shot.enabled`.
+- `Runner(..., node_shell: NodeShell | None = None)`; `preflight(api, cfg, node_shell=None)`.
 - Preflight adds a `node_shell` step when mode != off: run `true` (ssh) or
   check `os.geteuid() == 0` and `shutil.which("qm")` (local).
 

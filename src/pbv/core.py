@@ -48,9 +48,16 @@ class ConfigError(PbvError):
 
 
 class PreflightError(PbvError):
-    """The target environment is unsafe or unusable. Exit code 2."""
+    """The target environment is unsafe or unusable. Exit code 2.
+
+    ``steps`` carries the preflight steps run so far (the last one failed).
+    """
 
     code = "PREFLIGHT_FAIL"
+
+    def __init__(self, message: str, *, steps: list[StepResult] | None = None, code: str | None = None) -> None:
+        super().__init__(message, code=code)
+        self.steps: list[StepResult] = list(steps or [])
 
 
 class ApiError(PbvError):
@@ -310,6 +317,7 @@ class RunReport:
     vms: list[VmResult] = field(default_factory=list)
     preflight: list[StepResult] = field(default_factory=list)
     leftovers_swept: list[int] = field(default_factory=list)
+    sweep_failures: list[str] = field(default_factory=list)  # "<temp vmid>: <code> <message>" — still present
     interrupted: bool = False
     notify_errors: list[str] = field(default_factory=list)  # "<notifier>: <code> <message>"
     tool_version: str = ""
@@ -447,7 +455,10 @@ class CheckSuite(Protocol):
     """Plans and runs checks (``pbv.checks.CheckEngine``)."""
 
     def plan(self, target: VmTarget, guest: GuestAgent, os: OsFamily) -> list[CheckSpec]: ...
-    def run(self, spec: CheckSpec, guest: GuestAgent, ctx: CheckContext) -> CheckResult: ...  # never raises
+    def run(self, spec: CheckSpec, guest: GuestAgent, ctx: CheckContext) -> CheckResult:
+        """Never raises (InterruptedRun from a guest wrapper becomes an ERROR result);
+        callers check their stop flag after each call."""
+        ...
 
 
 @runtime_checkable
