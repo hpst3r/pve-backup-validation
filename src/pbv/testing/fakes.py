@@ -474,15 +474,15 @@ class FakeNodeShell:
 
     def __init__(self, pve: FakePve | None = None, *, fail: bool = False, probe_fails: bool | None = None) -> None:
         self.pve = pve
-        self.fail = fail  # qm_set and screendump fail
-        self.probe_fails = fail if probe_fails is None else probe_fails
+        self.fail = fail  # qm_set and screendump (and probe, unless probe_fails is set) fail
+        self.probe_fails = probe_fails
         self.qm_calls: list[tuple[int, dict[str, str], list[str]]] = []
         self.screendumps: list[int] = []
 
     def probe(self) -> str:
         from pbv.core import PbvError
 
-        if self.probe_fails:
+        if self.fail if self.probe_fails is None else self.probe_fails:
             raise PbvError("node shell: ssh exited 255", code="NODE_SHELL_FAIL")
         return "fake node shell ok"
 
