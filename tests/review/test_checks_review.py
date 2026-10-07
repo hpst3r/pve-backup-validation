@@ -74,10 +74,6 @@ class InterruptingGuest(FakeGuest):
 
 
 def test_interrupted_run_on_noncritical_check_is_error_not_warn(tmp_path: Path) -> None:
-    review_bug(
-        "core.CheckSuite.run contract: InterruptedRun becomes an ERROR result; engine maps "
-        "Kind.ERROR through spec.critical so a non-critical check reports WARN"
-    )
     clock = FakeClock()
     engine = CheckEngine(tmp_path, sleep=clock.sleep, clock=clock)
     r = engine.run(spec("command", argv=["true"], critical=False), InterruptingGuest(), make_ctx(tmp_path))
@@ -89,10 +85,6 @@ def test_interrupted_run_on_noncritical_check_is_error_not_warn(tmp_path: Path) 
 
 
 def test_warn_exit_is_not_retried_for_wait_s(tmp_path: Path) -> None:
-    review_bug(
-        "SPEC §5 retries only when a check fails; Kind.WARN (warn_exit / no-HTTP-client) is in RETRYABLE, "
-        "so a warn_exit script is re-executed until wait_s elapses"
-    )
     clock = FakeClock()
     engine = CheckEngine(tmp_path, sleep=clock.sleep, clock=clock)
     guest = FakeGuest()
@@ -108,10 +100,6 @@ def test_warn_exit_is_not_retried_for_wait_s(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(shutil.which("setsid") is None, reason="needs util-linux setsid")
 def test_default_run_host_bounded_when_grandchild_leaves_session(tmp_path: Path) -> None:
-    review_bug(
-        "scripts.default_run_host: after SIGKILL of the group it calls proc.communicate() with no "
-        "timeout; a grandchild in another session that inherited stdout blocks it forever"
-    )
     pidfile = tmp_path / "escaped.pid"
     script = tmp_path / "daemonize.sh"
     script.write_text(f'#!/bin/sh\nsetsid sleep 5 &\necho $! > "{pidfile}"\nsleep 5\n')
@@ -148,10 +136,6 @@ def test_default_run_host_bounded_when_grandchild_leaves_session(tmp_path: Path)
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs pwsh to evaluate the PowerShell wrapper")
 def test_windows_wrapper_missing_interpreter_is_not_exit_0() -> None:
-    review_bug(
-        "scripts.windows_script_argv: '& <interp> ...; exit $LASTEXITCODE' — when the interpreter is "
-        "not found $LASTEXITCODE is $null and 'exit $null' exits 0, so the check PASSes"
-    )
     argv = windows_script_argv("C:\\Windows\\Temp\\pbv-x-1-check.py", "pbv-no-such-interpreter.exe", [], {"A": "1"})
     assert argv[0] == "powershell.exe"
     cmd = ["pwsh", *argv[1:]]

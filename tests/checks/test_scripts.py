@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import os
+import shutil
+import signal
 import subprocess
 import time
 from collections.abc import Sequence
@@ -189,10 +192,53 @@ def test_windows_script_by_extension(
     assert g.files == {dest: b"Write-Output ok\r\n"}
     script = g.calls[0][0][-1]
     assert g.calls[0][0][0] == "powershell.exe"
-    assert expect_call.format(dest=dest) + " 'it''s'; exit $LASTEXITCODE" in script
+    assert "try { " + expect_call.format(dest=dest) + " 'it''s' } catch { " in script
+    assert script.endswith("if ($null -eq $LASTEXITCODE) { exit 1 }; exit $LASTEXITCODE")
     assert "$env:PBV_OS = 'windows'; " in script
     assert "$env:PBV_GUEST_IPS = '10.99.0.5,fd00::5'; " in script
     assert "Remove-Item -LiteralPath" in g.calls[1][0][-1]
+
+
+def test_windows_cmd_script_metachar_arg_is_error(tmp_path: Path, clock: FakeClock) -> None:
+    src = tmp_path / "check.cmd"
+    src.write_bytes(b"@echo ok\r\n")
+    engine = CheckEngine(tmp_path, sleep=clock.sleep, clock=clock)
+    g = FakeGuest(os=OsFamily.WINDOWS)
+    r = engine.run(spec("script", path=str(src), args=["a & del x"]), g, make_ctx(tmp_path, OsFamily.WINDOWS))
+    assert r.status is Status.ERROR and "cmd.exe metacharacters" in r.summary
+    assert g.files == {} and g.calls == []
+
+
+def test_windows_cmd_script_args_quoted_in_wrapper(tmp_path: Path, clock: FakeClock) -> None:
+    src = tmp_path / "check.bat"
+    src.write_bytes(b"@echo %1\r\n")
+    engine = CheckEngine(tmp_path, sleep=clock.sleep, clock=clock)
+    g = FakeGuest(os=OsFamily.WINDOWS)
+    g.default = res(0, "ok\r\n")
+    r = engine.run(spec("script", path=str(src), args=["a b"]), g, make_ctx(tmp_path, OsFamily.WINDOWS))
+    assert r.status is Status.PASS, r.summary
+    assert "-1-check.bat' '\"a b\"' }" in g.calls[0][0][-1]
+
+
+def _run_wrapper_in_pwsh(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    assert argv[0] == "powershell.exe"
+    return subprocess.run(["pwsh", *argv[1:]], capture_output=True, text=True, timeout=30, check=False)
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs pwsh to evaluate the PowerShell wrapper")
+def test_windows_wrapper_exit_codes_in_pwsh(tmp_path: Path) -> None:
+    from pbv.checks.scripts import windows_script_argv
+
+    missing = _run_wrapper_in_pwsh(windows_script_argv("C:\\x.py", "pbv-no-such-interpreter.exe", [], {}))
+    assert missing.returncode == 1 and "not recognized" in missing.stdout
+    sh = tmp_path / "exit3.sh"
+    sh.write_text('echo "$PBV_X $1"\nexit 3\n')
+    passthrough = _run_wrapper_in_pwsh(windows_script_argv(str(sh), "sh", ["arg"], {"PBV_X": "v"}))
+    assert passthrough.returncode == 3 and passthrough.stdout.strip() == "v arg"
+    ps1 = tmp_path / "throws.ps1"
+    ps1.write_text("throw 'boom'\n")
+    thrown = _run_wrapper_in_pwsh(windows_script_argv(str(ps1), "pwsh -NoProfile -NonInteractive -File", [], {}))
+    assert thrown.returncode != 0
 
 
 # ── host_script ────────────────────────────────────────────────────────────────
@@ -304,6 +350,24 @@ def test_default_run_host_sigterm_suffices(tmp_path: Path) -> None:
     with pytest.raises(subprocess.TimeoutExpired):
         default_run_host([str(script)], env={"PATH": os.environ.get("PATH", "")}, cwd=tmp_path, timeout_s=0.3)
     assert time.monotonic() - t0 < 2  # did not wait for the 5 s grace period
+
+
+@pytest.mark.skipif(shutil.which("setsid") is None, reason="needs util-linux setsid")
+def test_default_run_host_bounded_when_escaped_grandchild_holds_stdout(tmp_path: Path) -> None:
+    pidfile = tmp_path / "escaped.pid"
+    script = _host_script(tmp_path, f'echo before\nsetsid sleep 5 &\necho $! > "{pidfile}"\nsleep 5\n')
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(subprocess.TimeoutExpired) as ei:
+            default_run_host(
+                [str(script)], env={"PATH": os.environ.get("PATH", "")}, cwd=tmp_path, timeout_s=0.3, grace_s=0.2
+            )
+        assert time.monotonic() - t0 < 1.5
+        assert b"before" in (ei.value.output or b"")  # partial output survives
+    finally:
+        if pidfile.exists() and pidfile.read_text().strip():
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(int(pidfile.read_text()), signal.SIGKILL)
 
 
 def test_host_script_injected_runner_and_signal_death(tmp_path: Path, clock: FakeClock, ctx: CheckContext) -> None:

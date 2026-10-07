@@ -251,24 +251,37 @@ def test_windows_http_argv_injection_inert_and_shape() -> None:
     assert "PBV_BODY" not in _ps_script(windows.http_argv({"port": 80}, 5))
 
 
+WRAP_TAIL = " } catch { Write-Output $_.Exception.Message; exit 1 }; if ($null -eq $LASTEXITCODE) { exit 1 }; exit $LASTEXITCODE"
+
+
 def test_windows_script_argv_variants() -> None:
     env = {"PBV_RUN_ID": "r", "EVIL": EVIL_PS}
     dest = "C:\\Windows\\Temp\\pbv-r-1-c.ps1"
     s = _ps_script(scripts.windows_script_argv(dest, "", ["a b", EVIL_PS], env))
     assert s.startswith("$env:PBV_RUN_ID = 'r'; $env:EVIL = 'x''; Remove-Item C:\\ -Recurse; '''; ")
     assert (
-        "& powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "
-        "'C:\\Windows\\Temp\\pbv-r-1-c.ps1' 'a b' 'x''; Remove-Item C:\\ -Recurse; '''; exit $LASTEXITCODE"
+        "try { & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "
+        "'C:\\Windows\\Temp\\pbv-r-1-c.ps1' 'a b' 'x''; Remove-Item C:\\ -Recurse; '''" + WRAP_TAIL
     ) in s
     assert "Remove-Item" not in _ps_tokens_outside_quotes(s)
     cmd = _ps_script(scripts.windows_script_argv("C:\\T\\x.cmd", "", [], {}))
-    assert cmd == "& cmd.exe /c 'C:\\T\\x.cmd'; exit $LASTEXITCODE"
+    assert cmd == "try { & cmd.exe /c 'C:\\T\\x.cmd'" + WRAP_TAIL
     bat = _ps_script(scripts.windows_script_argv("C:\\T\\x.BAT", "", ["1"], {}))
-    assert bat == "& cmd.exe /c 'C:\\T\\x.BAT' '1'; exit $LASTEXITCODE"
+    assert bat == "try { & cmd.exe /c 'C:\\T\\x.BAT' '1'" + WRAP_TAIL
     custom = _ps_script(
         scripts.windows_script_argv("C:\\T\\x.py", '"C:\\Program Files\\Python\\python.exe" -u', [], {})
     )
-    assert custom == "& 'C:\\Program Files\\Python\\python.exe' '-u' 'C:\\T\\x.py'; exit $LASTEXITCODE"
+    assert custom == "try { & 'C:\\Program Files\\Python\\python.exe' '-u' 'C:\\T\\x.py'" + WRAP_TAIL
+
+
+def test_windows_cmd_script_args_are_double_quoted_for_cmd() -> None:
+    s = _ps_script(scripts.windows_script_argv("C:\\T\\x.cmd", "", ["a b", "plain", "", "tab\there"], {}))
+    assert s == "try { & cmd.exe /c 'C:\\T\\x.cmd' '\"a b\"' 'plain' '\"\"' '\"tab\there\"'" + WRAP_TAIL
+    # Only cmd.exe gets the extra double quotes; PowerShell/other interpreters do not.
+    ps = _ps_script(scripts.windows_script_argv("C:\\T\\x.ps1", "", ["a b"], {}))
+    assert "'a b'" in ps and '"' not in ps
+    py = _ps_script(scripts.windows_script_argv("C:\\T\\x.cmd", "python.exe", ["a b"], {}))
+    assert "'a b'" in py and '"a b"' not in py
 
 
 def test_no_double_quotes_in_windows_discovery() -> None:
