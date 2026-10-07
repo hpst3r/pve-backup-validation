@@ -102,7 +102,7 @@ fatal step are skipped, but cleanup always runs.
 | 3 | `space`: storage `avail ≥ backup.size × min_free_space_ratio` (skipped if size is 0 or `avail` is unknown) | `INSUFFICIENT_SPACE` → ERROR |
 | 4 | `restore`: `POST /nodes/{n}/qemu` with `vmid`, `archive`, `storage`, `unique=1`, optional `pool` and `bwlimit`; then wait for the task (`restore_timeout_s`). On timeout, call `stop_task(upid)` | `RESTORE_FAIL` → FAIL (task exitstatus + log tail in message); `RESTORE_TIMEOUT` → FAIL |
 | 5 | `mark`: set `tags` (existing + `restore.tag`), `description` marker, `onboot=0`; delete `protection` | `SANITIZE_FAIL` → ERROR |
-| 6 | `sanitize`: see §3; a single `update_vm_config(set, delete)` call | `SANITIZE_FAIL` → ERROR (a 403 adds the hint "token lacks privilege — hostpci/usb/args/hookscript changes need root@pam") |
+| 6 | `sanitize`: see §3 and §1a. The API part is one `update_vm_config(set, delete)`; the root part is one `NodeShell.qm_set` | `SANITIZE_FAIL` → ERROR (a 403 or "only root" error adds a `[node_shell]` hint); `SANITIZE_NEEDS_ROOT` → FAIL; `NODE_SHELL_FAIL` → ERROR |
 | 7 | `start`: start the VM and wait for the task (120 s) | `START_FAIL` → FAIL (task exitstatus) |
 | 8 | `boot`: poll `agent_ping` every 5 s until `boot_timeout_s`. If `vm_status` turns `stopped`, that is `BOOT_FAIL`. Take a console screenshot when screenshots are not `off` | `BOOT_TIMEOUT` / `BOOT_FAIL` → FAIL |
 | 9 | `settle`: sleep `run.settle_s`. OS = the configured `os`, else `GuestAgent.os_family()`. IPs = `GuestAgent.ip_addresses()` (an empty list is fine) | — |

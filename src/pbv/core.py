@@ -435,6 +435,7 @@ class NodeShell(Protocol):
     ``screendump`` (root-only in PVE 9).
     """
 
+    def probe(self) -> str: ...  # e.g. "ssh root@node: ok"; raises PbvError(code="NODE_SHELL_FAIL")
     def qm_set(
         self, vmid: int, set_: Mapping[str, str], delete: Sequence[str]
     ) -> None: ...  # raises PbvError(code="NODE_SHELL_FAIL")
