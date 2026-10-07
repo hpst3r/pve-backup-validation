@@ -156,12 +156,13 @@ def test_guard_refusal_in_cleanup_is_reported_never_destroyed(env: Env):
 def test_restore_failure_cleans_locked_vm_and_continues(env: Env):
     cfg = two_vms(env)
     env.pve.restore_fails[105] = "unable to restore: chunk missing"
-    report = env.runner(cfg).run()
+    report = env.runner(cfg, node_shell=env.node_shell).run()
     vm105, vm110 = report.vms
     assert vm105.status is Status.FAIL and vm105.failure_code == "RESTORE_FAIL"
     assert "chunk missing" in vm105.failure_message and "qmrestore" in vm105.failure_message  # log tail
     assert step(vm105, "cleanup").status is Status.PASS and vm105.cleanup_ok
-    assert (900105, True) in find_calls(env.pve, "destroy_vm")  # skiplock retry for the locked VM
+    assert env.node_shell.unlocks == [900105]  # `qm unlock` for the locked VM, never skiplock
+    assert all(not a[1] for n, a in env.pve.calls if n in ("stop_vm", "destroy_vm"))
     assert "start_vm" not in [n for n, a in env.pve.calls if a and a[0] == 900105]
     assert vm110.status is Status.PASS
     assert not env.pve.vms
@@ -182,7 +183,7 @@ def test_restore_api_error_without_status_cleans_possibly_created_vm(env: Env):
     assert step(vm, "cleanup").status is Status.PASS and 900105 not in env.pve.vms
 
 
-def test_restore_api_error_with_status_does_not_touch_vm(env: Env):
+def test_restore_api_error_4xx_does_not_touch_vm(env: Env):
     add_backup(env.pve, 105)
     env.pve.fail_next["restore_vm"] = ApiError("permission denied", status=403)
     vm = env.runner(env.cfg()).run().vms[0]
@@ -191,13 +192,73 @@ def test_restore_api_error_with_status_does_not_touch_vm(env: Env):
     assert not find_calls(env.pve, "destroy_vm")
 
 
+@pytest.mark.parametrize("status", [500, 502, 504])
+def test_restore_api_error_after_send_cleans_up_created_vm(env: Env, status: int):
+    class ProxyTimeout(FakePve):
+        def restore_vm(self, vmid, archive, storage, **kw):
+            super().restore_vm(vmid, archive, storage, **kw)  # the worker was forked...
+            raise ApiError("HTTP error: got timeout", status=status, transient=True)
+
+    env.pve = ProxyTimeout()
+    add_backup(env.pve, 105)
+    vm = env.runner(env.cfg()).run().vms[0]
+    assert vm.failure_code == "RESTORE_FAIL" and vm.status is Status.FAIL
+    assert step(vm, "cleanup").status is Status.PASS and vm.cleanup_ok
+    assert 900105 not in env.pve.vms
+
+
+def test_restore_api_error_after_send_without_vm_is_clean(env: Env):
+    add_backup(env.pve, 105)
+    env.pve.fail_next["restore_vm"] = ApiError("HTTP 503", status=503, transient=True)
+    vm = env.runner(env.cfg()).run().vms[0]
+    cleanup = step(vm, "cleanup")
+    assert cleanup.status is Status.PASS and "does not exist" in cleanup.message and vm.cleanup_ok
+    assert not find_calls(env.pve, "destroy_vm")
+
+
+@pytest.mark.parametrize("status", [500, 502])
+def test_restore_already_exists_never_destroys_foreign_vm(env: Env, status: int):
+    """A foreign VM appears on the temp VMID after the temp_vmid check (race); restore then fails."""
+
+    class Race(FakePve):
+        def restore_vm(self, vmid, archive, storage, **kw):
+            self.add_vm(vmid, {"name": "foreign"}, status="running")  # untagged, not ours
+            try:
+                super().restore_vm(vmid, archive, storage, **kw)
+            except ApiError as exc:
+                raise ApiError(str(exc), status=status) from exc
+            raise AssertionError("restore over an existing VM must fail")
+
+    env.pve = Race()
+    add_backup(env.pve, 105)
+    vm = env.runner(env.cfg()).run().vms[0]
+    assert vm.failure_code == "RESTORE_FAIL" and "already exists" in vm.failure_message
+    assert step(vm, "cleanup").status is Status.SKIPPED
+    assert env.pve.vms[900105].config == {"name": "foreign"} and env.pve.vms[900105].status == "running"
+    assert not [a for n, a in env.pve.calls if n in ("stop_vm", "destroy_vm", "update_vm_config")]
+
+
+def test_untagged_temp_vmid_never_destroyed_even_if_restore_raises(env: Env):
+    add_backup(env.pve, 105)
+    env.pve.add_vm(900105, {"name": "foreign"})
+    env.pve.fail_next["restore_vm"] = ApiError("got timeout", status=500, transient=True)
+    report = env.runner(env.cfg(run={"sweep_leftovers": False})).run()
+    assert report.preflight[-1].name == "temp_range" and exit_code(report) == 2  # refused before any VM
+    r = env.runner(env.cfg())
+    vm = r._process_vm(r.cfg.vm_target(105)).result  # bypass preflight: the temp_vmid step must refuse too
+    assert vm.failure_code == "TEMP_VMID_BUSY" and step(vm, "cleanup").status is Status.SKIPPED
+    assert not find_calls(env.pve, "restore_vm") and 900105 in env.pve.vms
+    assert not find_calls(env.pve, "destroy_vm")
+
+
 # ── A5 restore timeout ──────────────────────────────────────────────────────────
 def test_restore_timeout_stops_task_and_cleans_up(env: Env):
     add_backup(env.pve, 105)
     env.pve.restore_hangs.add(105)
-    report = env.runner(env.cfg(restore={"restore_timeout_s": 60})).run()
+    report = env.runner(env.cfg(restore={"restore_timeout_s": 60}), node_shell=env.node_shell).run()
     vm = report.vms[0]
     assert vm.failure_code == "RESTORE_TIMEOUT" and vm.status is Status.FAIL
+    assert env.node_shell.unlocks == [900105]
     upid = find_calls(env.pve, "wait_task")[0][0]
     assert env.pve.stopped_tasks == [upid]
     assert sum(a[1] for a in find_calls(env.pve, "wait_task") if a[0] == upid) == pytest.approx(60)
@@ -208,7 +269,7 @@ def test_stop_task_error_is_ignored(env: Env):
     add_backup(env.pve, 105)
     env.pve.restore_hangs.add(105)
     env.pve.fail_next["stop_task"] = ApiError("no such task", status=500)
-    vm = env.runner(env.cfg(restore={"restore_timeout_s": 60})).run().vms[0]
+    vm = env.runner(env.cfg(restore={"restore_timeout_s": 60}), node_shell=env.node_shell).run().vms[0]
     assert vm.failure_code == "RESTORE_TIMEOUT" and vm.cleanup_ok
 
 
@@ -359,7 +420,8 @@ def test_interrupt_during_restore_wait_stops_task(env: Env):
     add_backup(env.pve, 105)
     env.pve.restore_hangs.add(105)
     pve = env.pve
-    report = env.runner(env.cfg(), should_stop=lambda: bool(find_calls(pve, "wait_task"))).run()
+    stop = lambda: bool(find_calls(pve, "wait_task"))  # noqa: E731
+    report = env.runner(env.cfg(), should_stop=stop, node_shell=env.node_shell).run()
     vm = report.vms[0]
     assert vm.failure_code == "INTERRUPTED" and report.interrupted
     assert len(pve.stopped_tasks) == 1 and 900105 not in pve.vms
@@ -602,6 +664,9 @@ def test_node_shell_qm_set_failure(env: Env):
     class QmSetFails(FakeNodeShell):
         def probe(self) -> str:
             return "ok"
+
+        def sysctl(self, key: str) -> str:
+            return "restore01" if key == "kernel.hostname" else "1"
 
     add_backup(env.pve, 105, config={"name": "x", "args": "-cpu host"})
     env.node_shell = QmSetFails(env.pve, fail=True)
@@ -879,7 +944,18 @@ def _vm(status: Status, cleanup_ok: bool = True) -> VmResult:
         (_report(_vm(Status.FAIL)), False, 1),
         (_report(_vm(Status.ERROR)), False, 1),
         (_report(_vm(Status.FAIL), _vm(Status.ERROR, cleanup_ok=False)), False, 3),
-        (_report(_vm(Status.ERROR, cleanup_ok=False), interrupted=True), False, 130),
+        (_report(_vm(Status.ERROR, cleanup_ok=False), interrupted=True), False, 3),  # 3 > 130
+        (_report(_vm(Status.ERROR), sweep_failures=["900200: CLEANUP_FAIL x"], interrupted=True), False, 3),
+        (_report(_vm(Status.ERROR), interrupted=True), False, 130),
+        (
+            _report(
+                status=Status.ERROR,
+                preflight=[StepResult("node", Status.FAIL, "", 0, "x", "PREFLIGHT_FAIL")],
+                interrupted=True,
+            ),
+            False,
+            130,
+        ),
         (
             _report(status=Status.ERROR, preflight=[StepResult("node", Status.FAIL, "", 0, "x", "PREFLIGHT_FAIL")]),
             False,
@@ -891,3 +967,193 @@ def _vm(status: Status, cleanup_ok: bool = True) -> VmResult:
 )
 def test_exit_code(report, fail_on_warn, code):
     assert exit_code(report, fail_on_warn=fail_on_warn) == code
+
+
+# ── fix wave: locked VMs (SPEC §4 step 1) ───────────────────────────────────────
+def test_locked_vm_without_node_shell_fails_cleanup_with_vm_locked(env: Env):
+    add_backup(env.pve, 105)
+    env.pve.restore_fails[105] = "unable to restore: chunk missing"
+    report = env.runner(env.cfg()).run()
+    vm = report.vms[0]
+    cleanup = step(vm, "cleanup")
+    assert cleanup.status is Status.ERROR and cleanup.error_code == "CLEANUP_FAIL" and not vm.cleanup_ok
+    assert "VM_LOCKED" in cleanup.message and "locked (create)" in cleanup.message
+    assert "configure [node_shell] or run `qm unlock 900105`" in cleanup.message
+    assert "MANUAL CLEANUP REQUIRED: VM 900105 on restore01" in cleanup.message
+    assert env.clock.sleeps == [5, 15, 30]  # retries/backoff unchanged
+    assert not find_calls(env.pve, "destroy_vm") and not find_calls(env.pve, "stop_vm")
+    assert 900105 in env.pve.vms and report.status is Status.ERROR and exit_code(report) == 3
+
+
+def test_unlock_failure_is_retried_then_cleanup_fail(env: Env):
+    add_backup(env.pve, 105)
+    env.pve.restore_fails[105] = "unable to restore: chunk missing"
+
+    class UnlockFails(FakeNodeShell):
+        def unlock(self, vmid: int) -> None:
+            self.unlocks.append(vmid)
+            raise PbvError("node shell: ssh exited 255", code="NODE_SHELL_FAIL")
+
+    env.node_shell = UnlockFails(env.pve)
+    vm = env.runner(env.cfg(), node_shell=env.node_shell).run().vms[0]
+    assert env.node_shell.unlocks == [900105] * 4
+    assert not vm.cleanup_ok and "NODE_SHELL_FAIL" in step(vm, "cleanup").message
+
+
+def test_unlocked_vm_is_not_unlocked(env: Env):
+    add_backup(env.pve, 105)
+    vm = env.runner(env.cfg(), node_shell=env.node_shell).run().vms[0]
+    assert vm.status is Status.PASS and env.node_shell.unlocks == []
+
+
+def test_sweep_unlocks_locked_leftover(env: Env):
+    env.pve.add_vm(900200, {"name": "left", "tags": "pbv-temp", "lock": "backup"}, status="running")
+    r = env.runner(env.cfg(), node_shell=env.node_shell)
+    assert r.sweep() == [900200] and env.node_shell.unlocks == [900200]
+
+
+def test_unlock_never_touches_foreign_vm(env: Env):
+    env.pve.add_vm(900200, {"name": "foreign", "lock": "backup"})
+    r = env.runner(env.cfg(), node_shell=env.node_shell)
+    with pytest.raises(SafetyError):
+        r._destroy(900200)
+    assert env.node_shell.unlocks == [] and 900200 in env.pve.vms
+
+
+# ── fix wave: cleanup in finally ────────────────────────────────────────────────
+class _RaisingSuite(FakeCheckSuite):
+    def __init__(self, exc: BaseException) -> None:
+        super().__init__(planned=[C1])
+        self.exc = exc
+
+    def run(self, spec, guest, ctx):
+        raise self.exc
+
+
+def test_keyboard_interrupt_in_vm_cleans_up_and_returns_interrupted_report(env: Env):
+    cfg = two_vms(env)
+    env.checks = _RaisingSuite(KeyboardInterrupt())
+    report = env.runner(cfg).run()
+    vm105, vm110 = report.vms
+    assert vm105.status is Status.ERROR and vm105.failure_code == "INTERRUPTED"
+    assert step(vm105, "cleanup").status is Status.PASS and 900105 not in env.pve.vms
+    assert "screenshot" not in [s.name for s in vm105.steps]
+    assert vm110.failure_code == "NOT_RUN" and vm110.status is Status.SKIPPED
+    assert report.interrupted and report.status is Status.ERROR and exit_code(report) == 130
+    assert env.notifier.reports == [report]
+
+
+@pytest.mark.parametrize("exc", [SystemExit(1), GeneratorExit()], ids=["SystemExit", "GeneratorExit"])
+def test_other_base_exceptions_clean_up_then_propagate(env: Env, exc: BaseException):
+    add_backup(env.pve, 105)
+    env.checks = _RaisingSuite(exc)
+    with pytest.raises(type(exc)):
+        env.runner(env.cfg()).run()
+    assert 900105 not in env.pve.vms
+    assert ("destroy_vm", (900105, False)) in env.pve.calls
+
+
+def test_screenshot_bug_is_contained(env: Env):
+    add_backup(env.pve, 105)
+    env.checks = FakeCheckSuite(planned=[C1], results={"c1": Status.FAIL})
+    r = env.runner(env.cfg(**SHOTS))
+
+    def boom(st):
+        raise RuntimeError("screenshot bug")
+
+    r._screenshot = boom
+    report = r.run()
+    vm = report.vms[0]
+    shot = step(vm, "screenshot")
+    assert shot.status is Status.WARN and "screenshot bug" in shot.message
+    assert vm.failure_code == "CHECKS_FAILED" and step(vm, "cleanup").status is Status.PASS
+    assert 900105 not in env.pve.vms and env.notifier.reports == [report]
+
+
+def test_keyboard_interrupt_in_screenshot_still_cleans_up(env: Env):
+    add_backup(env.pve, 105)
+    r = env.runner(env.cfg(**SHOTS_ALWAYS))
+
+    def interrupt(st):
+        raise KeyboardInterrupt
+
+    r._screenshot = interrupt
+    report = r.run()
+    assert report.interrupted and report.vms[0].failure_code == "INTERRUPTED"
+    assert 900105 not in env.pve.vms
+
+
+# ── fix wave: keep_on_failure only for sanitized VMs ────────────────────────────
+def test_keep_on_failure_destroys_vm_whose_sanitize_failed(env: Env):
+    add_backup(env.pve, 105, config={"name": "db", "net0": "virtio=BC:24:11:00:00:01,bridge=vmbr0", "args": "-x"})
+    vm = env.runner(env.cfg(restore={"keep_on_failure": True})).run().vms[0]
+    assert vm.failure_code == "SANITIZE_NEEDS_ROOT"
+    cleanup = step(vm, "cleanup")
+    assert cleanup.status is Status.PASS and "not kept: sanitize failed" in cleanup.message
+    assert "not kept: sanitize failed" in vm.sanitized and "kept for debugging" not in vm.sanitized
+    assert 900105 not in env.pve.vms
+
+
+def test_keep_on_failure_destroys_vm_when_sanitize_did_not_run(env: Env):
+    add_backup(env.pve, 105)
+    env.pve.fail_next["update_vm_config"] = ApiError("mark failed", status=500)
+    vm = env.runner(env.cfg(restore={"keep_on_failure": True})).run().vms[0]
+    assert vm.status is Status.ERROR and "not kept: sanitize did not run" in vm.sanitized
+    assert 900105 not in env.pve.vms
+
+
+# ── fix wave: late interrupts ───────────────────────────────────────────────────
+def test_signal_during_final_cleanup_marks_report_interrupted(env: Env):
+    flag = {"stop": False}
+
+    class SignalOnDestroy(FakePve):
+        def destroy_vm(self, vmid, *, skiplock=False):
+            flag["stop"] = True
+            return super().destroy_vm(vmid, skiplock=skiplock)
+
+    env.pve = SignalOnDestroy()
+    add_backup(env.pve, 105)
+    report = env.runner(env.cfg(), should_stop=lambda: flag["stop"]).run()
+    assert report.vms[0].status is Status.PASS and 900105 not in env.pve.vms
+    assert report.interrupted and report.status is Status.ERROR and exit_code(report) == 130
+
+
+def test_signal_during_startup_sweep_runs_no_vm(env: Env):
+    flag = {"stop": False}
+
+    class SignalOnDestroy(FakePve):
+        def destroy_vm(self, vmid, *, skiplock=False):
+            flag["stop"] = True
+            return super().destroy_vm(vmid, skiplock=skiplock)
+
+    env.pve = SignalOnDestroy()
+    add_backup(env.pve, 105)
+    env.pve.add_vm(900200, {"name": "left", "tags": "pbv-temp"})
+    report = env.runner(env.cfg(), should_stop=lambda: flag["stop"]).run()
+    assert report.leftovers_swept == [900200]
+    assert report.vms[0].failure_code == "NOT_RUN" and not find_calls(env.pve, "restore_vm")
+    assert report.interrupted and exit_code(report) == 130
+
+
+def test_stop_flag_count_counts_as_stop(env: Env):
+    add_backup(env.pve, 105)
+    stop = StopFlag()
+    stop.count = 1  # a signal was recorded even though ``stopped`` was reset
+    report = env.runner(env.cfg(), stop_flag=stop).run()
+    assert report.interrupted and report.vms[0].failure_code == "NOT_RUN"
+
+
+def test_leftover_on_interrupt_exits_3(env: Env):
+    add_backup(env.pve, 105)
+    flag = {"stop": False}
+
+    class StopThenFailDestroy(FakeCheckSuite):
+        def run(self, spec, guest, ctx):
+            flag["stop"] = True
+            env.pve.destroy_fails.add(900105)
+            return super().run(spec, guest, ctx)
+
+    env.checks = StopThenFailDestroy(planned=[C1])
+    report = env.runner(env.cfg(), should_stop=lambda: flag["stop"]).run()
+    assert report.interrupted and not report.vms[0].cleanup_ok
+    assert exit_code(report) == 3

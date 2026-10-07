@@ -74,11 +74,14 @@ def new_run_id(now: datetime | None = None) -> str:
 
 
 def exit_code(report: RunReport, *, fail_on_warn: bool = False) -> int:
-    """Process exit code for a finished run (SPEC §8; 2 for config and 4 for lock are the CLI's)."""
-    if report.interrupted:
-        return 130
+    """Process exit code for a finished run (SPEC §8; 2 for config and 4 for lock are the CLI's).
+
+    Precedence 3 > 130 > 2 > 1 > 0: a leftover VM always surfaces as 3, even on interrupt.
+    """
     if report.sweep_failures or any(not vm.cleanup_ok for vm in report.vms):
         return 3
+    if report.interrupted:
+        return 130
     if any(step.status in (Status.FAIL, Status.ERROR) for step in report.preflight):
         return 2
     bad = {Status.FAIL, Status.ERROR} | ({Status.WARN} if fail_on_warn else set())
@@ -187,7 +190,8 @@ class Runner:
 
     # ── small helpers ──────────────────────────────────────────────────────────
     def _should_stop(self) -> bool:
-        return bool(self._should_stop_cb() or (self.stop_flag is not None and self.stop_flag()))
+        flag = self.stop_flag
+        return bool(self._should_stop_cb() or (flag is not None and (flag() or flag.count > 0)))
 
     def _check_stop(self, where: str) -> None:
         if self._should_stop():
@@ -294,48 +298,57 @@ class Runner:
             log.critical("SAFETY_REFUSED vmid=%d reason=not a pbv temp VM", vmid)
             raise SafetyError(f"refusing to stop/destroy VM {vmid}: not a pbv temporary VM")
 
-    def _locked_call(self, fn: Callable[..., str], vmid: int) -> str:
-        try:
-            return fn(vmid)
-        except ApiError as exc:
-            if vmid in self.created_by_run and "lock" in str(exc).lower():
-                log.info("CLEANUP_SKIPLOCK vmid=%d reason=%s", vmid, exc)
-                return fn(vmid, skiplock=True)
-            raise
-
-    def _destroy_once(self, vmid: int) -> None:
-        if not self.api.vm_exists(vmid):
+    def _unlock(self, vmid: int) -> None:
+        """Clear a config ``lock`` (SPEC §4 step 1). skiplock is root@pam-only, so never sent via the API."""
+        lock = self.api.get_vm_config(vmid).get("lock", "")
+        if not lock:
             return
+        if self.node_shell is None:
+            raise PbvError(
+                f"VM {vmid} is locked ({lock}); configure [node_shell] or run `qm unlock {vmid}`", code="VM_LOCKED"
+            )
         self._guard(vmid)
+        log.info("CLEANUP_UNLOCK vmid=%d lock=%s", vmid, lock)
+        self.node_shell.unlock(vmid)
+
+    def _destroy_once(self, vmid: int) -> bool:
+        if not self.api.vm_exists(vmid):
+            return False
+        self._guard(vmid)
+        self._unlock(vmid)
         if self.api.vm_status(vmid) != "stopped":
             self._guard(vmid)
-            res = self.api.wait_task(self._locked_call(self.api.stop_vm, vmid), STOP_TIMEOUT_S)
+            res = self.api.wait_task(self.api.stop_vm(vmid), STOP_TIMEOUT_S)
             if not res.ok:
                 raise CleanupError(f"stop task failed: {res.exitstatus}")
         self._guard(vmid)
-        res = self.api.wait_task(self._locked_call(self.api.destroy_vm, vmid), DESTROY_TIMEOUT_S)
+        res = self.api.wait_task(self.api.destroy_vm(vmid), DESTROY_TIMEOUT_S)
         if not res.ok:
             raise CleanupError(f"destroy task failed: {res.exitstatus}")
         if self.api.vm_exists(vmid):
             raise CleanupError(f"VM {vmid} still exists after destroy")
+        return True
 
-    def _destroy(self, vmid: int) -> None:
-        """Stop + destroy + verify with retries (SPEC §4). Raises SafetyError or CleanupError."""
-        last: Exception | None = None
+    def _destroy(self, vmid: int) -> bool:
+        """Unlock + stop + destroy + verify with retries (SPEC §4). Raises SafetyError or CleanupError.
+
+        Returns False if the VM did not exist (nothing to do).
+        """
+        last = ""
         for attempt, delay in enumerate((0, *CLEANUP_BACKOFF_S), start=1):
             if delay:
                 self.sleep(delay)
             try:
-                self._destroy_once(vmid)
+                existed = self._destroy_once(vmid)
             except SafetyError:
                 raise
-            except (ApiError, PbvTimeoutError, CleanupError) as exc:
-                last = exc
-                log.warning("CLEANUP_RETRY vmid=%d attempt=%d error=%s", vmid, attempt, exc)
+            except PbvError as exc:
+                last = str(exc) if exc.code in (CleanupError.code, ApiError.code) else f"{exc.code}: {exc}"
+                log.warning("CLEANUP_RETRY vmid=%d attempt=%d error=%s", vmid, attempt, last)
                 continue
-            log.info("CLEANUP_OK vmid=%d attempts=%d", vmid, attempt)
+            log.info("CLEANUP_OK vmid=%d attempts=%d existed=%s", vmid, attempt, existed)
             self.created_by_run.discard(vmid)
-            return
+            return existed
         raise CleanupError(f"VM {vmid} could not be destroyed after {1 + len(CLEANUP_BACKOFF_S)} attempts: {last}")
 
     def sweep(self, include_kept: bool = False) -> list[int]:
@@ -380,7 +393,9 @@ class Runner:
         )
         with self._file_log(self.log_dir / self.run_id / "run.log"):
             log.info("RUN_START run_id=%s node=%s version=%s", self.run_id, self.cfg.target.node, self.tool_version)
-            if self._prepare(report):
+            prepared = self._prepare(report)
+            self._note_interrupt(report)
+            if prepared:
                 try:
                     targets = self.resolve_targets(vmids)
                 except PbvError as exc:
@@ -388,6 +403,7 @@ class Runner:
                     log.error("TARGETS_FAIL code=%s error=%s", exc.code, exc)
                 else:
                     self._run_vms(report, targets)
+                    self._note_interrupt(report)
             report.status = _run_status(report)
             report.finished_at = utc_now_iso()
             report.duration_s = round(self.clock() - t0, 3)
@@ -401,6 +417,12 @@ class Runner:
             )
             self._notify(report, "run_finished", report)
         return report
+
+    def _note_interrupt(self, report: RunReport) -> None:
+        """A signal seen after the last poll (last check, final cleanup, sweep) still marks the run."""
+        if not report.interrupted and self._should_stop():
+            report.interrupted = True
+            log.warning("RUN_INTERRUPTED stop requested; the report is marked interrupted")
 
     def _prepare(self, report: RunReport) -> bool:
         """Preflight and leftover sweep; False if preflight failed."""
@@ -471,37 +493,51 @@ class Runner:
         with self._file_log(work_dir / "vm.log") as log_file:
             st.result.log_file = str(log_file) if log_file else ""
             log.info("VM_START vmid=%d temp=%d run_id=%s", target.vmid, target.temp_vmid, self.run_id)
+            # Cleanup runs in ``finally`` so that even SystemExit (re-raised afterwards) leaves no VM behind.
             try:
-                self._lifecycle(st)
-            except _Fatal:
-                pass  # recorded by _step
-            except InterruptedRun as exc:
+                self._contained_lifecycle(st)
+                if st.started and not st.interrupted:
+                    self._safe_screenshot(st)
+            except KeyboardInterrupt:
                 st.interrupted = True
-                self._mark(st, exc.code, Status.ERROR, str(exc), fatal=True)
-                log.warning("VM_INTERRUPTED vmid=%d", target.vmid)
-            except Exception as exc:  # boundary: one VM's bug must not stop the run
-                msg = f"{type(exc).__name__}: {exc}"
-                self._mark(st, "INTERNAL_ERROR", Status.ERROR, msg, fatal=True)
-                log.error("INTERNAL_ERROR vmid=%d error=%s", target.vmid, msg)
-                _trace.debug("INTERNAL_ERROR traceback vmid=%d", target.vmid, exc_info=True)
-            if st.started and not st.interrupted:
-                self._screenshot(st)
-            self._cleanup_vm(st)
-            res = st.result
-            code, message = st.fatal or st.nonfatal or ("", "")
-            res.failure_code, res.failure_message = code, message
-            res.sanitized.extend(st.notes)
-            res.duration_s = round(self.clock() - st.t0, 3)
-            log.info(
-                "VM_END vmid=%d temp=%d status=%s code=%s cleanup_ok=%s dur=%.0fs",
-                target.vmid,
-                target.temp_vmid,
-                res.status.value,
-                res.failure_code or "-",
-                res.cleanup_ok,
-                res.duration_s,
-            )
+                self._mark(st, InterruptedRun.code, Status.ERROR, "interrupted (KeyboardInterrupt)", fatal=True)
+                log.warning("VM_INTERRUPTED vmid=%d reason=KeyboardInterrupt", target.vmid)
+            finally:
+                self._cleanup_vm(st)
+                self._finish_vm(st)
         return st
+
+    def _contained_lifecycle(self, st: _VmRun) -> None:
+        """Run the lifecycle; every Exception is recorded on the VM (SPEC §2)."""
+        try:
+            self._lifecycle(st)
+        except _Fatal:
+            pass  # recorded by _step
+        except InterruptedRun as exc:
+            st.interrupted = True
+            self._mark(st, exc.code, Status.ERROR, str(exc), fatal=True)
+            log.warning("VM_INTERRUPTED vmid=%d", st.target.vmid)
+        except Exception as exc:  # boundary: one VM's bug must not stop the run
+            msg = f"{type(exc).__name__}: {exc}"
+            self._mark(st, "INTERNAL_ERROR", Status.ERROR, msg, fatal=True)
+            log.error("INTERNAL_ERROR vmid=%d error=%s", st.target.vmid, msg)
+            _trace.debug("INTERNAL_ERROR traceback vmid=%d", st.target.vmid, exc_info=True)
+
+    def _finish_vm(self, st: _VmRun) -> None:
+        res = st.result
+        code, message = st.fatal or st.nonfatal or ("", "")
+        res.failure_code, res.failure_message = code, message
+        res.sanitized.extend(st.notes)
+        res.duration_s = round(self.clock() - st.t0, 3)
+        log.info(
+            "VM_END vmid=%d temp=%d status=%s code=%s cleanup_ok=%s dur=%.0fs",
+            st.target.vmid,
+            st.target.temp_vmid,
+            res.status.value,
+            res.failure_code or "-",
+            res.cleanup_ok,
+            res.duration_s,
+        )
 
     def _mark(self, st: _VmRun, code: str, status: Status, message: str, *, fatal: bool) -> None:
         st.result.status = Status.worst([st.result.status, status])
@@ -648,8 +684,9 @@ class Runner:
                 bwlimit_kib=r.bwlimit_kib or None,
             )
         except ApiError as exc:
-            if exc.status is None:
-                self.created_by_run.add(temp)  # unknown outcome: the VM may exist
+            if _restore_may_have_created(exc):
+                # The request may have been processed: cleanup checks vm_exists and removes it if present.
+                self.created_by_run.add(temp)
             raise _Fatal(
                 "RESTORE_FAIL", Status.ERROR if exc.status is None else Status.FAIL, f"restore: {exc}"
             ) from exc
@@ -812,6 +849,15 @@ class Runner:
             raise _Fatal(out.code, out.status, out.message)
         return out
 
+    def _safe_screenshot(self, st: _VmRun) -> None:
+        """The screenshot step is never fatal, not even through a bug in it (SPEC §2 step 11)."""
+        try:
+            self._screenshot(st)
+        except Exception as exc:  # boundary: a screenshot bug must not skip cleanup or the report
+            log.warning("SCREENSHOT_FAIL vmid=%d error=%s", st.target.vmid, type(exc).__name__)
+            _trace.debug("screenshot traceback vmid=%d", st.target.vmid, exc_info=True)
+            st.result.steps.append(_step("screenshot", Status.WARN, utc_now_iso(), 0.0, f"screenshot failed: {exc}"))
+
     def _screenshot(self, st: _VmRun) -> None:
         shot = self.cfg.screenshot
         if self.console is None or not shot.enabled:
@@ -859,20 +905,22 @@ class Runner:
         if temp not in self.created_by_run:
             record(Status.SKIPPED, "nothing to clean up (no restore attempted)")
             return
+        not_kept = ""
         with self._cleanup_phase():
             try:
                 failed = st.result.status.rank >= Status.FAIL.rank
-                if (
-                    self.cfg.restore.keep_on_failure
-                    and failed
-                    and not st.interrupted
-                    and self.api.vm_exists(temp)
-                    and self._keep(st)
-                ):
+                want_keep = self.cfg.restore.keep_on_failure and failed and not st.interrupted
+                sanitize = [s.status for s in st.result.steps if s.name == "sanitize"]
+                if want_keep and sanitize != [Status.PASS]:
+                    # Unsanitized: NICs may still be on the production bridge, passthrough still attached.
+                    not_kept = f"not kept: sanitize {'failed' if sanitize else 'did not run'}"
+                    st.notes.append(not_kept)
+                    log.warning("KEEP_REFUSED vmid=%d temp=%d reason=sanitize did not pass", st.target.vmid, temp)
+                elif want_keep and self.api.vm_exists(temp) and self._keep(st):
                     record(Status.SKIPPED, f"kept for debugging (keep_on_failure): VM {temp} tagged {KEEP_TAG}")
                     self.created_by_run.discard(temp)
                     return
-                self._destroy(temp)
+                existed = self._destroy(temp)
             except SafetyError as exc:
                 record(Status.ERROR, str(exc), exc.code)
                 self._mark(st, exc.code, Status.ERROR, str(exc), fatal=True)
@@ -888,10 +936,23 @@ class Runner:
                     "CLEANUP_FAIL vmid=%d temp=%d node=%s error=%s", st.target.vmid, temp, self.cfg.target.node, exc
                 )
                 return
-        record(Status.PASS, f"destroyed {temp}")
+        message = f"destroyed {temp}" if existed else f"VM {temp} does not exist; nothing to destroy"
+        record(Status.PASS, message + (f" ({not_kept})" if not_kept else ""))
 
 
 # ── module helpers ──────────────────────────────────────────────────────────────
+def _restore_may_have_created(exc: ApiError) -> bool:
+    """Whether a failed restore POST may still have created the temp VM.
+
+    A 4xx means PVE refused the request before doing anything. "already exists"
+    means the VMID belongs to someone else (temp_vmid checked it was free just
+    before), so claiming it would let cleanup destroy a foreign VM.
+    """
+    if "already exists" in str(exc).lower():
+        return False
+    return exc.status is None or not 400 <= exc.status < 500
+
+
 def _step(name: str, status: Status, started: str, dur: float, message: str = "", code: str = "") -> StepResult:
     return StepResult(name=name, status=status, started_at=started, duration_s=dur, message=message, error_code=code)
 

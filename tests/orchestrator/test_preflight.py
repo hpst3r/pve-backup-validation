@@ -8,9 +8,18 @@ from pbv.core import ApiError, PreflightError, Status
 from pbv.orchestrator import PreflightFailure, preflight
 from pbv.testing.fakes import FakeNodeShell, FakePve, FakeStorage
 
-from .conftest import make_cfg
+from .conftest import make_cfg, node_shell
 
-STEP_NAMES = ["version", "node", "standalone", "bridge", "backup_storage", "target_storage", "temp_range"]
+STEP_NAMES = [
+    "version",
+    "node",
+    "standalone",
+    "bridge",
+    "bridge_ipv6",
+    "backup_storage",
+    "target_storage",
+    "temp_range",
+]
 
 
 def fails_at(pve: FakePve, cfg, step: str, needle: str = "", **kw) -> PreflightError:
@@ -22,7 +31,7 @@ def fails_at(pve: FakePve, cfg, step: str, needle: str = "", **kw) -> PreflightE
     assert [s.name for s in exc.steps] == names[: names.index(step) + 1]
     last = exc.steps[-1]
     assert last.status in (Status.FAIL, Status.ERROR) and last.error_code == "PREFLIGHT_FAIL"
-    assert all(s.status is Status.PASS for s in exc.steps[:-1])
+    assert all(s.status in (Status.PASS, Status.WARN) for s in exc.steps[:-1])
     assert needle in last.message
     return exc
 
@@ -33,7 +42,9 @@ def test_all_guards_pass(tmp_path):
     pve.add_vm(105, {"name": "prod"})  # outside the temp range: ignored
     steps = preflight(pve, make_cfg(tmp_path))
     assert [s.name for s in steps] == STEP_NAMES
-    assert all(s.status is Status.PASS and not s.error_code for s in steps)
+    assert all(s.status is Status.PASS and not s.error_code for s in steps if s.name != "bridge_ipv6")
+    ipv6 = steps[STEP_NAMES.index("bridge_ipv6")]
+    assert ipv6.status is Status.WARN and not ipv6.error_code and "cannot verify" in ipv6.message
     assert "9.0.10" in steps[0].message
     assert not [
         c for c in pve.calls if c[0] not in {"version", "cluster_status", "node_networks", "storage_list", "list_vms"}
@@ -167,10 +178,11 @@ def test_api_error_is_preflight_error(tmp_path):
 
 # ── SPEC §1a: node_shell step ───────────────────────────────────────────────────
 def test_node_shell_step_after_version_when_enabled(tmp_path):
-    shell = FakeNodeShell()
+    shell = node_shell()
     steps = preflight(FakePve(), make_cfg(tmp_path, node_shell={"mode": "local"}), shell)
     assert [s.name for s in steps] == ["version", "node_shell", *STEP_NAMES[1:]]
     assert steps[1].status is Status.PASS and steps[1].message == "fake node shell ok"
+    assert all(s.status is Status.PASS for s in steps)
 
 
 def test_node_shell_not_probed_when_off(tmp_path):
@@ -205,3 +217,69 @@ def test_node_shell_without_probe_is_refused(tmp_path):
 
 def test_preflight_failure_alias_is_core_error():
     assert PreflightFailure is PreflightError
+
+
+# ── fix wave: bridge must not obtain an address (SPEC §1 guard 3) ───────────────
+@pytest.mark.parametrize(
+    "extra",
+    [{"method": "dhcp"}, {"method": "static"}, {"method6": "auto"}, {"method6": "dhcp"}, {"gateway6": "fe80::1"}],
+)
+def test_refuses_bridge_that_obtains_an_address(tmp_path, extra):
+    pve = FakePve()
+    pve.networks[1].update(extra)
+    key = next(iter(extra))
+    fails_at(pve, make_cfg(tmp_path), "bridge", f"{key}={extra[key]}")
+
+
+@pytest.mark.parametrize("extra", [{}, {"method": "manual"}, {"method6": "manual", "method": "manual"}])
+def test_bridge_manual_method_ok(tmp_path, extra):
+    pve = FakePve()
+    pve.networks[1].update(extra)
+    steps = preflight(pve, make_cfg(tmp_path))
+    assert steps[STEP_NAMES.index("bridge")].status is Status.PASS
+
+
+def test_bridge_ipv6_verified_through_node_shell(tmp_path):
+    steps = preflight(FakePve(), make_cfg(tmp_path), node_shell=node_shell())
+    ipv6 = steps[STEP_NAMES.index("bridge_ipv6")]
+    assert ipv6.status is Status.PASS and "net.ipv6.conf.vmbr99.disable_ipv6 = 1" in ipv6.message
+
+
+@pytest.mark.parametrize("value", ["0", ""])
+def test_bridge_ipv6_enabled_is_refused_with_hint(tmp_path, value):
+    shell = node_shell()
+    shell.sysctls["net.ipv6.conf.vmbr99.disable_ipv6"] = value
+    exc = fails_at(FakePve(), make_cfg(tmp_path), "bridge_ipv6", "link-local", node_shell=shell)
+    hint = "echo 'net.ipv6.conf.vmbr99.disable_ipv6 = 1' > /etc/sysctl.d/90-pbv.conf; sysctl --system"
+    assert hint in exc.steps[-1].message
+
+
+def test_bridge_ipv6_sysctl_error_is_fatal(tmp_path):
+    shell = node_shell()
+    del shell.sysctls["net.ipv6.conf.vmbr99.disable_ipv6"]
+    fails_at(FakePve(), make_cfg(tmp_path), "bridge_ipv6", "cannot stat", node_shell=shell)
+
+
+def test_bridge_ipv6_not_checked_when_isolation_disabled(tmp_path):
+    steps = preflight(FakePve(), make_cfg(tmp_path, restore={"require_isolated_bridge": False}))
+    assert "bridge_ipv6" not in [s.name for s in steps]
+
+
+# ── fix wave: node_shell reaches the right host ─────────────────────────────────
+@pytest.mark.parametrize("host", ["restore01", "restore01.example.org"])
+def test_node_shell_hostname_matches_node(tmp_path, host):
+    steps = preflight(FakePve(), make_cfg(tmp_path, node_shell={"mode": "local"}), node_shell(host=host))
+    assert steps[1].name == "node_shell" and steps[1].status is Status.PASS
+
+
+@pytest.mark.parametrize("host", ["pve-prod1", "pve-prod1.example.org", "restore011"])
+def test_node_shell_hostname_mismatch_is_fatal(tmp_path, host):
+    cfg = make_cfg(tmp_path, node_shell={"mode": "ssh", "ssh_host": "restore01"})
+    needle = f"node_shell reaches host {host}, expected restore01"
+    exc = fails_at(FakePve(), cfg, "node_shell", needle, node_shell=node_shell(host=host))
+    assert exc.steps[-1].status is Status.FAIL
+
+
+def test_node_shell_hostname_unreadable_is_fatal(tmp_path):
+    cfg = make_cfg(tmp_path, node_shell={"mode": "local"})
+    fails_at(FakePve(), cfg, "node_shell", "kernel/hostname", node_shell=FakeNodeShell())

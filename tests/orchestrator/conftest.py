@@ -122,7 +122,14 @@ class Env:
 def env(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> Env:
     caplog.set_level(logging.DEBUG, logger="pbv")
     pve = FakePve(node="restore01")
-    return Env(tmp_path, pve, FakeCheckSuite(), FakeConsole(), RecordingNotifier(), FakeClock(), FakeNodeShell(pve))
+    return Env(tmp_path, pve, FakeCheckSuite(), FakeConsole(), RecordingNotifier(), FakeClock(), node_shell(pve))
+
+
+def node_shell(pve: FakePve | None = None, host: str = "restore01", **kw: Any) -> FakeNodeShell:
+    """FakeNodeShell whose ``kernel.hostname`` matches the configured node (preflight checks it)."""
+    shell = FakeNodeShell(pve, **kw)
+    shell.sysctls["kernel.hostname"] = host
+    return shell
 
 
 def names(calls: list[tuple[str, tuple[Any, ...]]]) -> list[str]:
