@@ -45,6 +45,11 @@ EOF
     ifreload -a
 fi
 
+# No link-local IPv6 on the isolated bridge: otherwise restored guests could reach the
+# node's services (8006, ssh) over fe80::. pbv preflight verifies this via node_shell.
+echo "net.ipv6.conf.$BRIDGE.disable_ipv6 = 1" > /etc/sysctl.d/90-pbv-isolated-bridge.conf
+sysctl -q -w "net.ipv6.conf.$BRIDGE.disable_ipv6=1"
+
 # ── role ─────────────────────────────────────────────────────────────────────
 PRIVS="VM.Allocate VM.Audit VM.Backup VM.PowerMgmt VM.Config.Disk VM.Config.CDROM VM.Config.CPU \
 VM.Config.Memory VM.Config.Network VM.Config.HWType VM.Config.Options VM.Config.Cloudinit \
