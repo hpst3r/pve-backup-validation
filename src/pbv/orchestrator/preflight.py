@@ -3,7 +3,8 @@
 :func:`preflight` runs every guard in order and returns one ``StepResult``
 per guard. The first failing guard raises :class:`pbv.core.PreflightError`
 whose ``steps`` holds the steps recorded so far, so the caller can put them in
-the report. Nothing on the node is modified.
+the report. A guard may also yield a non-fatal WARN step. Nothing on the node
+is modified.
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ from pbv.core import ApiError, NodeShell, PbvError, PreflightError, PveApi, Stat
 log = logging.getLogger("pbv.orchestrator")
 
 _IP_FIELDS = ("cidr", "address", "cidr6", "address6", "gateway", "gateway6")
+_METHOD_FIELDS = ("method", "method6")
+_IPV6_HINT = "echo 'net.ipv6.conf.{br}.disable_ipv6 = 1' > /etc/sysctl.d/90-pbv.conf; sysctl --system"
 
 
 PreflightFailure = PreflightError
@@ -28,6 +31,10 @@ PreflightFailure = PreflightError
 
 class _GuardFail(Exception):
     """Internal: a guard found an unsafe or unusable condition."""
+
+
+class _GuardWarn(Exception):
+    """Internal: a guard could not verify something; recorded as WARN, not fatal."""
 
 
 def parse_tags(value: str) -> list[str]:
@@ -88,7 +95,29 @@ def _bridge(api: PveApi, cfg: Config) -> str:
     addrs = [f"{f}={br[f]}" for f in _IP_FIELDS if str(br.get(f) or "").strip()]
     if addrs:
         raise _GuardFail(f"bridge {want!r} has an IP configuration ({', '.join(addrs)}); it must be isolated")
+    methods = [f"{f}={br[f]}" for f in _METHOD_FIELDS if str(br.get(f) or "manual").strip().lower() != "manual"]
+    if methods:
+        raise _GuardFail(
+            f"bridge {want!r} obtains an address ({', '.join(methods)}); method/method6 must be absent or manual"
+        )
     return f"bridge {want} is isolated (no ports, no IP)"
+
+
+def _bridge_ipv6(cfg: Config, node_shell: NodeShell | None) -> str:
+    """The isolated bridge must have IPv6 disabled (no link-local address), SPEC §1 guard 3."""
+    br = cfg.restore.isolated_bridge
+    key = f"net.ipv6.conf.{br}.disable_ipv6"
+    if node_shell is None:
+        raise _GuardWarn(f"cannot verify {key} = 1 without [node_shell]; make sure IPv6 is disabled on {br}")
+    try:
+        value = str(node_shell.sysctl(key)).strip()
+    except PbvError as exc:
+        raise _GuardFail(f"cannot read {key}: {exc}") from exc
+    if value != "1":
+        raise _GuardFail(
+            f"{key} = {value or '?'}: the bridge has an IPv6 link-local address; fix: {_IPV6_HINT.format(br=br)}"
+        )
+    return f"{key} = 1"
 
 
 def _storage(api: PveApi, name: str) -> dict[str, Any]:
@@ -132,16 +161,22 @@ def _temp_range(api: PveApi, cfg: Config) -> str:
     return f"temp VMID range [{base + 100}, {2 * base}) is free of foreign VMs"
 
 
-def _node_shell(node_shell: NodeShell | None) -> str:
+def _node_shell(node_shell: NodeShell | None, cfg: Config) -> str:
+    """Probe the node shell and make sure it reaches ``target.node`` (short hostname == PVE node name)."""
     if node_shell is None:
         raise _GuardFail("node_shell configured but not provided")
     probe = getattr(node_shell, "probe", None)
     if not callable(probe):
         raise _GuardFail(f"node shell {type(node_shell).__name__} cannot be probed (no probe())")
     try:
-        return str(probe())
+        message = str(probe())
+        host = str(node_shell.sysctl("kernel.hostname")).strip()
     except PbvError as exc:
         raise _GuardFail(f"node shell unusable: {exc}") from exc
+    want = cfg.target.node
+    if host.split(".", 1)[0] != want.split(".", 1)[0]:
+        raise _GuardFail(f"node_shell reaches host {host or '?'}, expected {want}")
+    return message
 
 
 _Guard = Callable[[PveApi, Config], str]
@@ -160,11 +195,16 @@ def preflight(api: PveApi, cfg: Config, node_shell: NodeShell | None = None) -> 
     """Run every guard; raise :class:`pbv.core.PreflightError` at the first failure.
 
     When ``cfg.node_shell.mode`` is not ``off``, a ``node_shell`` step after
-    ``version`` probes ``node_shell`` (SPEC §1a).
+    ``version`` probes ``node_shell`` and checks its hostname (SPEC §1a). When
+    the bridge must be isolated, a ``bridge_ipv6`` step after ``bridge`` reads
+    its ``disable_ipv6`` sysctl through ``node_shell``, or WARNs without one.
     """
     guards = list(_GUARDS)
+    if cfg.restore.require_isolated_bridge:
+        at = [n for n, _ in guards].index("bridge") + 1
+        guards.insert(at, ("bridge_ipv6", lambda _api, _cfg: _bridge_ipv6(_cfg, node_shell)))
     if cfg.node_shell.mode != "off":
-        guards.insert(1, ("node_shell", lambda _api, _cfg: _node_shell(node_shell)))
+        guards.insert(1, ("node_shell", lambda _api, _cfg: _node_shell(node_shell, _cfg)))
     steps: list[StepResult] = []
     for name, guard in guards:
         t0 = time.monotonic()
@@ -172,11 +212,13 @@ def preflight(api: PveApi, cfg: Config, node_shell: NodeShell | None = None) -> 
         status, message = Status.PASS, ""
         try:
             message = guard(api, cfg)
+        except _GuardWarn as exc:
+            status, message = Status.WARN, str(exc)
         except _GuardFail as exc:
             status, message = Status.FAIL, str(exc)
         except ApiError as exc:
             status, message = Status.ERROR, f"API error: {exc}"
-        failed = status is not Status.PASS
+        failed = status in (Status.FAIL, Status.ERROR)
         steps.append(
             StepResult(
                 name=name,
@@ -190,5 +232,8 @@ def preflight(api: PveApi, cfg: Config, node_shell: NodeShell | None = None) -> 
         if failed:
             log.error("PREFLIGHT_FAIL step=%s reason=%s", name, message)
             raise PreflightError(f"preflight {name}: {message}", steps=steps)
-        log.info("PREFLIGHT_OK step=%s %s", name, message)
+        if status is Status.WARN:
+            log.warning("PREFLIGHT_WARN step=%s %s", name, message)
+        else:
+            log.info("PREFLIGHT_OK step=%s %s", name, message)
     return steps

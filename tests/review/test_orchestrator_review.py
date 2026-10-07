@@ -11,7 +11,7 @@ from pbv.core import ApiError, CheckResult, CheckSpec, Status
 from pbv.orchestrator import PreflightFailure, exit_code, preflight
 from pbv.testing.fakes import FakeCheckSuite, FakePve
 
-from ._support import TEMP, add_backup, make_cfg, make_runner, review_bug
+from ._support import TEMP, add_backup, make_cfg, make_runner
 
 ONE_CHECK = {"vmid": 105, "mode": "manual", "check": [{"type": "command", "argv": ["true"]}]}
 
@@ -27,24 +27,23 @@ class _RaisingChecks(FakeCheckSuite):
         raise self.exc
 
 
-def test_cleanup_runs_when_lifecycle_raises_base_exception(tmp_path: Path) -> None:
-    review_bug(
-        "runner.py:462-477 cleanup is not in a finally: a BaseException (KeyboardInterrupt/SystemExit) or any "
-        "exception from _screenshot skips _cleanup_vm and leaves the temp VM behind, unreported"
-    )
+@pytest.mark.parametrize("exc", [KeyboardInterrupt(), SystemExit(1)], ids=["KeyboardInterrupt", "SystemExit"])
+def test_cleanup_runs_when_lifecycle_raises_base_exception(tmp_path: Path, exc: BaseException) -> None:
+    # Fix-wave decision: KeyboardInterrupt is recorded as INTERRUPTED and run() returns the report
+    # (the CLI maps it to 130); SystemExit and other BaseExceptions are re-raised after cleanup.
     pve = FakePve()
     add_backup(pve)
-    runner = make_runner(make_cfg(tmp_path), pve, checks=_RaisingChecks(KeyboardInterrupt()))
-    with pytest.raises(KeyboardInterrupt):
-        runner.run()
-    assert TEMP not in pve.vms, "temp VM left behind after KeyboardInterrupt escaped the lifecycle"
+    runner = make_runner(make_cfg(tmp_path), pve, checks=_RaisingChecks(exc))
+    if isinstance(exc, KeyboardInterrupt):
+        report = runner.run()
+        assert report.interrupted and exit_code(report) == 130
+    else:
+        with pytest.raises(type(exc)):
+            runner.run()
+    assert TEMP not in pve.vms, f"temp VM left behind after {type(exc).__name__} escaped the lifecycle"
 
 
 def test_cleanup_runs_when_screenshot_step_raises(tmp_path: Path) -> None:
-    review_bug(
-        "runner.py:475-477 _screenshot runs outside the try; an exception there (today: AttributeError on "
-        "cfg.screenshot.mode for every started VM when a console is wired) skips cleanup and the whole report"
-    )
     pve = FakePve()
     add_backup(pve)
     runner = make_runner(make_cfg(tmp_path), pve)
@@ -62,10 +61,6 @@ def test_cleanup_runs_when_screenshot_step_raises(tmp_path: Path) -> None:
 
 
 def test_interrupt_during_last_check_marks_report_interrupted(tmp_path: Path) -> None:
-    review_bug(
-        "runner.py:778-786/_run_vms: a stop flag set during the LAST check of the LAST VM is never observed: "
-        "report.interrupted stays False, status PASS, exit 0 instead of 130"
-    )
     stop = {"flag": False}
 
     class StopChecks(FakeCheckSuite):
@@ -82,10 +77,6 @@ def test_interrupt_during_last_check_marks_report_interrupted(tmp_path: Path) ->
 
 
 def test_signal_during_final_cleanup_is_reported(tmp_path: Path) -> None:
-    review_bug(
-        "runner.py:417-441: a SIGTERM recorded while the last VM's cleanup runs is dropped; the run "
-        "reports PASS / exit 0 although SPEC §4 says the report is marked interrupted (exit 130)"
-    )
     stop = {"flag": False}
 
     class SignalOnDestroy(FakePve):
@@ -101,10 +92,6 @@ def test_signal_during_final_cleanup_is_reported(tmp_path: Path) -> None:
 
 
 def test_sweep_failure_is_reported(tmp_path: Path) -> None:
-    review_bug(
-        "runner.py:348-352: a tagged leftover that the startup sweep cannot destroy is only logged; "
-        "report.sweep_failures stays empty, the run is PASS and exit 0 (in-flight per briefs/orchns.md #4)"
-    )
     pve = FakePve()
     add_backup(pve)
     pve.add_vm(900_200, {"name": "leftover", "tags": "pbv-temp"})
@@ -116,12 +103,6 @@ def test_sweep_failure_is_reported(tmp_path: Path) -> None:
 
 
 def test_restore_post_5xx_after_send_still_cleans_up(tmp_path: Path) -> None:
-    review_bug(
-        "runner.py:638-643: a restore POST that fails with an HTTP status after it was sent (pveproxy "
-        "500 'got timeout' / 502-504, ApiError.transient) may still have created the VM, but temp is only "
-        "added to created_by_run for status None; cleanup is SKIPPED and the untagged VM blocks every later "
-        "preflight (temp_range guard)"
-    )
 
     class SlowProxy(FakePve):
         def restore_vm(self, vmid: int, archive: str, storage: str, **kw: Any) -> str:
@@ -137,11 +118,6 @@ def test_restore_post_5xx_after_send_still_cleans_up(tmp_path: Path) -> None:
 
 
 def test_keep_on_failure_never_keeps_unsanitized_vm_on_production_bridge(tmp_path: Path) -> None:
-    review_bug(
-        "runner.py:837-847: keep_on_failure keeps a VM whose sanitize FAILED, so it is left with its NIC on "
-        "the production bridge (and passthrough devices); a manual start puts a clone of a production VM "
-        "(same IPs) on the production network"
-    )
     pve = FakePve()  # token_is_root=False: the API refuses to delete hostpci0 → sanitize fails
     add_backup(
         pve,
@@ -165,11 +141,6 @@ def test_keep_on_failure_never_keeps_unsanitized_vm_on_production_bridge(tmp_pat
     ids=["dhcp4", "slaac6", "dhcp6"],
 )
 def test_preflight_rejects_bridge_that_obtains_an_address(tmp_path: Path, extra: dict[str, str]) -> None:
-    review_bug(
-        "preflight.py:89-95: the isolation guard only checks static cidr/address/gateway fields; a bridge "
-        "with method=dhcp or method6=auto/dhcp gets an address at runtime, so restored guests can reach the "
-        "restore node (8006/ssh) — SPEC §1 'the bridge cannot route anywhere'"
-    )
     pve = FakePve()
     pve.networks = [{"iface": "vmbr99", "type": "bridge", "bridge_ports": "", "active": 1, **extra}]
     with pytest.raises(PreflightFailure):
