@@ -41,6 +41,7 @@ PPM_MAGIC = b"P6"
 NODE_SHELL_FAIL = "NODE_SHELL_FAIL"
 _SAFE_PATH = re.compile(r"^/[A-Za-z0-9_./-]*$")
 _KEY = re.compile(r"^[a-z][a-z0-9_-]*$")
+_SYSCTL_KEY = re.compile(r"^[a-z0-9_][a-z0-9_.-]*$")  # no leading "-": never an option
 _STDERR_MAX = 200
 
 Run = Callable[..., "subprocess.CompletedProcess[Any]"]
@@ -67,7 +68,7 @@ class NodeShellRunner:
             raise ConfigError(f"node_shell.mode: NodeShellRunner needs 'local' or 'ssh', got {cfg.mode!r}")
         remote_dir = cfg.remote_dir.rstrip("/") or "/"
         # Interpolated into an HMP command line and a remote shell command.
-        if not _SAFE_PATH.match(remote_dir):
+        if not _SAFE_PATH.fullmatch(remote_dir):
             raise ConfigError("node_shell.remote_dir: must be an absolute path of [A-Za-z0-9_./-] characters")
         host = cfg.ssh_host or node
         if cfg.mode == "ssh" and not host:
@@ -110,14 +111,26 @@ class NodeShellRunner:
         self._qm(["qm", "list"], f"ssh {self._target()}")
         return f"ssh {self._target()}: ok"
 
+    def unlock(self, vmid: int) -> None:
+        """Run ``qm unlock <vmid>``; raises NODE_SHELL_FAIL."""
+        _check_vmid(vmid)
+        self._qm(["qm", "unlock", str(vmid)], f"qm unlock {vmid}")
+        log.info("NODE_SHELL_UNLOCK vmid=%s", vmid)
+
+    def sysctl(self, key: str) -> str:
+        """Run ``sysctl -n <key>`` on the node; returns stripped stdout, raises NODE_SHELL_FAIL."""
+        if not isinstance(key, str) or not _SYSCTL_KEY.fullmatch(key):
+            raise PbvError(f"node shell: refusing invalid sysctl key {key!r}", code=NODE_SHELL_FAIL)
+        proc = self._qm(["sysctl", "-n", key], f"sysctl {key}")
+        return _text(proc.stdout).strip()
+
     def qm_set(self, vmid: int, set_: Mapping[str, str], delete: Sequence[str]) -> None:
         """Run ``qm set <vmid> --k v ... --delete k1,k2``; raises NODE_SHELL_FAIL."""
-        if not isinstance(vmid, int) or isinstance(vmid, bool):
-            raise PbvError(f"node shell: vmid must be an int, got {type(vmid).__name__}", code=NODE_SHELL_FAIL)
+        _check_vmid(vmid)
         if not set_ and not delete:
             return
         for key in [*set_, *delete]:
-            if not isinstance(key, str) or not _KEY.match(key):
+            if not isinstance(key, str) or not _KEY.fullmatch(key):
                 raise PbvError(f"node shell: refusing invalid config key {key!r}", code=NODE_SHELL_FAIL)
         for key, value in set_.items():
             if not isinstance(value, str):
@@ -262,6 +275,11 @@ class NodeShellRunner:
         if self.cfg.ssh_known_hosts_file:
             opts += ["-o", f"UserKnownHostsFile={self.cfg.ssh_known_hosts_file}"]
         return opts
+
+
+def _check_vmid(vmid: Any) -> None:
+    if not isinstance(vmid, int) or isinstance(vmid, bool):
+        raise PbvError(f"node shell: vmid must be an int, got {type(vmid).__name__}", code=NODE_SHELL_FAIL)
 
 
 def _text(data: Any) -> str:

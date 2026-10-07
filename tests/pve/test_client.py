@@ -8,7 +8,7 @@ import logging
 import pytest
 
 from pbv.config import TargetConfig
-from pbv.core import ApiError, GuestAgentError, PbvTimeoutError, PveApi
+from pbv.core import ApiError, ConfigError, GuestAgentError, PbvTimeoutError, PveApi
 from pbv.pve import PveClient, api_path, normalize_fingerprint
 from pbv.pve.client import FILE_WRITE_MAX_BYTES, _maybe_b64
 
@@ -647,3 +647,53 @@ def test_from_config(srv: Server) -> None:
     assert c.node == "restore01"
     assert c.version() == {"version": "9"}
     assert SECRET not in repr(c)
+
+
+@pytest.mark.parametrize(
+    ("token_id", "secret", "field"),
+    [
+        ("pbv@pve!t\r\nX-Evil: 1", SECRET, "token_id"),
+        (TOKEN_ID, "abc def", "token_secret"),
+        (TOKEN_ID, "abc\r\nX-Injected: 1", "token_secret"),
+        (TOKEN_ID, "abc\x7f", "token_secret"),
+        (TOKEN_ID, "abc\n", "token_secret"),
+        ("pbv@pve!t\n", SECRET, "token_id"),
+        (TOKEN_ID, "sécret", "token_secret"),
+        (TOKEN_ID, "", "token_secret"),
+    ],
+)
+def test_from_config_rejects_header_unsafe_token(token_id: str, secret: str, field: str) -> None:
+    target = TargetConfig(host="127.0.0.1", node="restore01", token_id=token_id, token_secret=secret)
+    with pytest.raises(ConfigError, match=f"target.{field}: must be non-empty printable ASCII") as ei:
+        PveClient.from_config(target)
+    assert "X-" not in str(ei.value)
+    if secret:
+        assert secret not in str(ei.value)
+
+
+def test_header_injection_secret_is_secret_free_bad_request(srv: Server, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.DEBUG)
+    c = PveClient(
+        "127.0.0.1",
+        "restore01",
+        TOKEN_ID,
+        "SENTINEL\r\nX-Injected: 1",
+        port=srv.port,
+        fingerprint=srv.fingerprint,
+        retries=3,
+        sleep=lambda s: pytest.fail("API_BAD_REQUEST must not be retried"),
+    )
+    with pytest.raises(ApiError) as ei:
+        c.version()
+    assert ei.value.code == "API_BAD_REQUEST"
+    assert not ei.value.transient
+    assert "SENTINEL" not in str(ei.value)
+    assert "SENTINEL" not in caplog.text
+    assert srv.requests == []
+
+
+def test_invalid_url_becomes_bad_request(srv: Server) -> None:
+    with pytest.raises(ApiError, match=r"GET /x y: request could not be built: InvalidURL") as ei:
+        srv.client().request("GET", "/x y")
+    assert ei.value.code == "API_BAD_REQUEST"
+    assert srv.requests == []
