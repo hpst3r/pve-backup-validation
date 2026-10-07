@@ -1,9 +1,16 @@
-# Local instance files — never commit real secrets or VM lists.
-# Copy the *.example versions and edit those locally / on the node.
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.runs/
+# local configs / secrets
+/config.toml
+*.secret
+*.token
 backup_validation.env
 backup_validation.conf
-
-# Runtime artifacts
-*.log
-*.ppm
-*.png
+.runs/

@@ -1,0 +1,152 @@
+# pbv example configuration — copy to /etc/pbv/config.toml and chmod 640.
+# Relative paths below resolve against the directory of THIS file.
+# Secrets are never inline: use <key>_file (chmod 600) or <key>_env.
+
+[target]
+# The standalone restore node. NOT a production cluster node.
+host = "pbv-restore01.lab.example"
+node = "pbv-restore01"                     # PVE node name as shown in the UI
+token_id = "pbv@pve!validation"
+token_secret_file = "secrets/pve-token"    # contains only the UUID secret
+# TLS: system CAs by default; or ca_file = "pve-ca.pem"; or pin the leaf cert:
+# fingerprint = "AB:CD:...:EF"            # `openssl x509 -noout -fingerprint -sha256 -in /etc/pve/local/pve-ssl.pem`
+verify_tls = true
+require_standalone = true                  # refuse to run if the node is in a cluster
+forbid_cluster_names = ["prod"]            # extra guard if require_standalone = false
+api_timeout_s = 30
+api_retries = 3
+
+[restore]
+backup_storage = "pbs-prod"                # PBS storage on the restore node pointing at the prod datastore
+target_storage = "local-lvm"               # scratch storage for temporary VMs (needs content "images")
+isolated_bridge = "vmbr-pbv"               # no bridge ports, no IP, no gateway
+require_isolated_bridge = true
+temp_vmid_base = 900000                    # temp VMID = base + source VMID (105 -> 900105)
+tag = "pbv-temp"
+# pool = "pbv"                             # optional PVE pool for temp VMs
+bwlimit_kib = 0                            # 0 = storage default
+restore_timeout_s = 3600
+min_free_space_ratio = 1.1                 # require avail >= backup size * ratio
+max_backup_age_h = 36                      # 0 disables; older newest-backup => FAIL (test still runs)
+keep_on_failure = false                    # true: leave failed VMs running (tag pbv-keep) for debugging
+
+[sanitize]
+# cpu_override = "x86-64-v2-AES"           # use if restore node CPU differs from prod (e.g. cpu=host)
+memory_max_mib = 8192                      # cap RAM of temp VMs; 0 keeps original
+vga = "std"                                # guarantees a framebuffer for console screenshots
+keep_serial = true
+
+[run]
+log_dir = "/var/log/pbv"
+state_dir = "/var/lib/pbv"
+lock_file = "/run/lock/pbv.lock"
+boot_timeout_s = 300
+settle_s = 15
+default_check_timeout_s = 60
+sweep_leftovers = true
+fail_on_warn = false
+selection = "listed"                       # "listed" = [[vm]] below; "all" = every VM with a backup
+exclude = []
+default_mode = "hybrid"                    # auto | hybrid | manual
+
+[screenshot]
+mode = "local"                             # off | local (pbv runs ON the restore node) | ssh
+when = "failure"                           # failure | always
+remote_dir = "/var/lib/pbv/screendump"
+# ssh_host = "pbv-restore01.lab.example"   # for mode = "ssh"
+# ssh_user = "root"
+# ssh_key_file = "secrets/id_ed25519"
+# ssh_known_hosts_file = "known_hosts"
+
+[notify.json]
+enabled = true
+when = "always"
+dir = "/var/lib/pbv/reports"
+write_latest = true
+keep = 90
+
+[notify.email]
+enabled = false
+when = "failure"                           # always | failure | never
+per_vm = false
+smtp_host = "smtp.example.com"
+smtp_port = 587
+security = "starttls"                      # starttls | ssl | none
+username = "pbv@example.com"
+password_file = "secrets/smtp-password"
+from = "pbv@example.com"
+to = ["ops@example.com"]
+subject_prefix = "[pbv]"
+attach_screenshots = true
+
+[notify.ntfy]
+enabled = false
+when = "always"
+server = "https://ntfy.sh"
+topic = "pbv-change-me-to-something-unguessable"
+# token_file = "secrets/ntfy-token"
+priority_ok = "low"
+priority_fail = "high"
+attach_screenshots = false
+
+[notify.telegram]
+enabled = false
+# token_file = "secrets/telegram-token"
+# chat_id = "-1001234567890"
+
+# Checks applied to every VM (filter by OS with os = "linux"/"windows").
+[[global_check]]
+type = "command"
+name = "filesystems mounted rw"
+os = "linux"
+argv = ["/bin/sh", "-c", "! grep -E '\\sro[\\s,]' /proc/mounts | grep -vE '\\s(squashfs|iso9660|tmpfs)\\s'"]
+critical = false
+
+# ── VMs ───────────────────────────────────────────────────────────────────────
+
+[[vm]]
+vmid = 105
+name = "web01"
+mode = "hybrid"                            # discovered checks + the ones below
+
+  [[vm.check]]
+  type = "http"
+  port = 443
+  scheme = "https"
+  path = "/healthz"
+  expect_status = [200]
+  body_regex = "ok"
+  wait_s = 120
+
+  [[vm.check]]
+  type = "script"                          # uploaded into the guest and run there
+  path = "scripts/check-app-db.sh"
+  args = ["--quick"]
+  env = { APP_ENV = "restore-test" }
+  timeout_s = 120
+
+  [[vm.check]]
+  type = "systemd"
+  unit = "myapp.service"
+
+[[vm]]
+vmid = 110
+name = "dc01"
+os = "windows"
+mode = "manual"
+boot_timeout_s = 600
+
+  [[vm.check]]
+  type = "windows_service"
+  service = "NTDS"
+  wait_s = 300
+
+  [[vm.check]]
+  type = "script"
+  path = "scripts/check-ad.ps1"            # .ps1 runs via powershell -File
+  timeout_s = 180
+
+  [[vm.check]]
+  type = "host_script"                     # runs on the pbv runner, not in the guest
+  path = "scripts/host-notes.sh"
+  critical = false
