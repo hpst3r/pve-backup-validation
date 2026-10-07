@@ -41,7 +41,7 @@ from typing import Any
 from urllib.parse import quote, urlencode
 
 from pbv.config import TargetConfig
-from pbv.core import ApiError, BackupRef, ExecStatus, GuestAgentError, PbvTimeoutError, TaskResult
+from pbv.core import ApiError, BackupRef, ConfigError, ExecStatus, GuestAgentError, PbvTimeoutError, TaskResult
 
 log = logging.getLogger("pbv.pve")
 
@@ -59,6 +59,7 @@ _AGENT_DOWN = re.compile(
     re.IGNORECASE,
 )
 _B64 = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+_TOKEN_CHARS = re.compile(r"^[\x21-\x7e]+$")
 
 Params = Mapping[str, Any]
 
@@ -156,7 +157,7 @@ def _maybe_b64(value: str, flag: bool | None) -> str:
     """
     if not value or flag is False:
         return value
-    if flag is None and (len(value) % 4 or not _B64.match(value)):
+    if flag is None and (len(value) % 4 or not _B64.fullmatch(value)):
         return value
     try:
         return base64.b64decode(value, validate=True).decode("utf-8")
@@ -169,6 +170,20 @@ def _as_int(value: Any, default: int | None = None) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def check_token(token_id: str, token_secret: str) -> None:
+    """Reject token values that are not printable ASCII without spaces/CR/LF.
+
+    Both go into the ``Authorization`` header. The messages never include the
+    value (the secret, or a mistyped one). Direct :class:`PveClient`
+    construction skips this; a bad value then fails the request with a
+    secret-free ``API_BAD_REQUEST``.
+    """
+    if not isinstance(token_id, str) or not _TOKEN_CHARS.fullmatch(token_id):
+        raise ConfigError("target.token_id: must be non-empty printable ASCII without spaces or line breaks")
+    if not isinstance(token_secret, str) or not _TOKEN_CHARS.fullmatch(token_secret):
+        raise ConfigError("target.token_secret: must be non-empty printable ASCII without spaces or line breaks")
 
 
 class PveClient:
@@ -218,7 +233,12 @@ class PveClient:
     # ── construction ───────────────────────────────────────────────────────────
     @classmethod
     def from_config(cls, target: TargetConfig, **kw: Any) -> PveClient:
-        """Build a client from ``[target]``; ``kw`` overrides (e.g. ``sleep``) for tests."""
+        """Build a client from ``[target]``; ``kw`` overrides (e.g. ``sleep``) for tests.
+
+        Raises ConfigError when the token id or secret could inject into the
+        ``Authorization`` header (see :func:`check_token`).
+        """
+        check_token(target.token_id, target.token_secret)
         args: dict[str, Any] = {
             "port": target.port,
             "verify_tls": target.verify_tls,
@@ -330,6 +350,14 @@ class PveClient:
                 conn.request(method, url, body=body, headers=headers)
                 resp = conn.getresponse()
                 raw = resp.read()
+            except (ValueError, http.client.InvalidURL) as e:
+                # Raised by http.client before anything is sent (bad URL characters, header value
+                # with CR/LF). The message may quote the Authorization header, so it is dropped.
+                log.debug("API_BAD_REQUEST method=%s path=%s type=%s", method, path, type(e).__name__)
+                raise _Attempt(
+                    ApiError(f"{where}: request could not be built: {type(e).__name__}", code="API_BAD_REQUEST"),
+                    sent=False,
+                ) from None
             except (OSError, http.client.HTTPException) as e:
                 raise _Attempt(
                     self._error(
@@ -511,9 +539,11 @@ class PveClient:
         return self._upid(self._post(self._qemu(vmid, "status", "start")), "start")
 
     def stop_vm(self, vmid: int, *, skiplock: bool = False) -> str:
+        """Stop a VM. ``skiplock`` is root@pam-only on PVE (tokens get 403); pbv itself never sets it."""
         return self._upid(self._post(self._qemu(vmid, "status", "stop"), {"skiplock": skiplock or None}), "stop")
 
     def destroy_vm(self, vmid: int, *, skiplock: bool = False) -> str:
+        """Destroy a VM with its disks. ``skiplock`` is root@pam-only on PVE; pbv itself never sets it."""
         params = {"purge": 1, "destroy-unreferenced-disks": 1, "skiplock": skiplock or None}
         return self._upid(self.request("DELETE", self._qemu(vmid), params).get("data"), "destroy")
 

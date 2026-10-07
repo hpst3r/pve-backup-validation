@@ -171,6 +171,7 @@ def test_from_config_none_when_off() -> None:
         (NodeShellConfig(mode="telnet"), "node_shell.mode"),
         (NodeShellConfig(mode="local", remote_dir="relative/dir"), "remote_dir"),
         (NodeShellConfig(mode="local", remote_dir="/tmp/a b"), "remote_dir"),
+        (NodeShellConfig(mode="local", remote_dir="/tmp/a\n"), "remote_dir"),
         (NodeShellConfig(mode="ssh", ssh_host="h", remote_dir="/tmp/$(id)"), "remote_dir"),
         (NodeShellConfig(mode="local", timeout_s=0), "timeout_s"),
     ],
@@ -258,6 +259,7 @@ def test_qm_set_noop_when_empty(tmp_path: Path) -> None:
         ({"a b": "x"}, [], "invalid config key"),
         ({}, ["hostpci0,usb0"], "invalid config key"),
         ({}, ["x;rm"], "invalid config key"),
+        ({"onboot\n": "0"}, [], "invalid config key"),
         ({"net0": 5}, [], "must be a string"),
     ],
 )
@@ -308,6 +310,87 @@ def test_qm_set_failure_without_stderr(tmp_path: Path) -> None:
 def test_qm_set_timeout_and_oserror(tmp_path: Path, err: BaseException, match: str) -> None:
     with pytest.raises(PbvError, match=match) as ei:
         local(tmp_path, FakeRun(fail={"qm": err})).qm_set(VMID, {"onboot": "0"}, [])
+    assert ei.value.code == "NODE_SHELL_FAIL"
+
+
+# ── unlock / sysctl ───────────────────────────────────────────────────────────
+
+
+class Stdout(FakeRun):
+    """FakeRun whose successful commands print ``out``."""
+
+    def __init__(self, out: bytes, **kw: Any) -> None:
+        super().__init__(**kw)
+        self.out = out
+
+    def __call__(self, argv: list[str], **kw: Any) -> subprocess.CompletedProcess[bytes]:
+        proc = super().__call__(argv, **kw)
+        return proc if proc.returncode else subprocess.CompletedProcess(argv, 0, self.out, b"")
+
+
+def test_unlock_local_and_ssh(tmp_path: Path) -> None:
+    run = FakeRun()
+    local(tmp_path, run).unlock(VMID)
+    ssh(run, ssh_port=2222).unlock(VMID)
+    assert run.argvs[0] == ["qm", "unlock", "900105"]
+    assert run.argvs[1][:-2] == ["ssh", *SSH_OPTS, "-p", "2222", "root@pve1.lan"]
+    assert shlex.split(remote_of(run.argvs[1])) == ["qm", "unlock", "900105"]
+    assert run.calls[1][1]["timeout"] == 7
+
+
+@pytest.mark.parametrize("vmid", ["900105; reboot", 900105.0, True])
+def test_unlock_rejects_non_int_vmid(tmp_path: Path, vmid: Any) -> None:
+    run = FakeRun()
+    with pytest.raises(PbvError, match="vmid must be an int") as ei:
+        local(tmp_path, run).unlock(vmid)
+    assert ei.value.code == "NODE_SHELL_FAIL"
+    assert run.calls == []
+
+
+@pytest.mark.parametrize(
+    ("fail", "match"),
+    [
+        (2, r"node shell: qm unlock 900105 failed \(exit 2\): Permission denied"),
+        (subprocess.TimeoutExpired(["ssh"], 7), r"node shell: qm unlock 900105 timed out after 7s"),
+        (FileNotFoundError(2, "No such file or directory", "ssh"), r"qm unlock 900105 could not run"),
+    ],
+)
+def test_unlock_failures(fail: Any, match: str) -> None:
+    with pytest.raises(PbvError, match=match) as ei:
+        ssh(FakeRun(fail={"ssh": fail})).unlock(VMID)
+    assert ei.value.code == "NODE_SHELL_FAIL"
+
+
+def test_sysctl_hostname_local_and_ssh(tmp_path: Path) -> None:
+    run = Stdout(b"pve1\n", remote_root=tmp_path)
+    assert local(tmp_path, run).sysctl("kernel.hostname") == "pve1"
+    assert ssh(run).sysctl("kernel.hostname") == "pve1"
+    assert run.argvs[0] == ["sysctl", "-n", "kernel.hostname"]
+    assert shlex.split(remote_of(run.argvs[1])) == ["sysctl", "-n", "kernel.hostname"]
+    assert run.calls[1][1]["capture_output"] is True
+
+
+def test_sysctl_str_stdout_and_other_keys(tmp_path: Path) -> None:
+    run = Stdout(" 1 \n")  # type: ignore[arg-type]  # text-mode run
+    assert local(tmp_path, run).sysctl("net.ipv4.ip_forward") == "1"
+    assert local(tmp_path, run).sysctl("net.ipv6.conf.vmbr0-1.disable_ipv6") == "1"
+
+
+@pytest.mark.parametrize(
+    "key", ["", "kernel.hostname; reboot", "Kernel.Hostname", "-a", "a b", "$(id)", "a/b", "x\n", 5]
+)
+def test_sysctl_rejects_bad_key(tmp_path: Path, key: Any) -> None:
+    run = FakeRun()
+    with pytest.raises(PbvError, match="invalid sysctl key") as ei:
+        local(tmp_path, run).sysctl(key)
+    assert ei.value.code == "NODE_SHELL_FAIL"
+    assert run.calls == []
+
+
+def test_sysctl_failure() -> None:
+    run = FakeRun(fail={"ssh:sysctl": 255}, stderr=b"sysctl: cannot stat /proc/sys/x/y: No such file or directory")
+    with pytest.raises(PbvError, match=r"node shell: sysctl x.y failed \(exit 255\): sysctl: cannot stat") as ei:
+        ssh(run).sysctl("x.y")
     assert ei.value.code == "NODE_SHELL_FAIL"
 
 
