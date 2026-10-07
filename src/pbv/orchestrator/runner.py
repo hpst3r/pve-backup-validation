@@ -30,10 +30,12 @@ from pbv.core import (
     GuestAgent,
     GuestAgentError,
     InterruptedRun,
+    NodeShell,
     Notifier,
     OsFamily,
     PbvError,
     PbvTimeoutError,
+    PreflightError,
     PveApi,
     RunReport,
     SafetyError,
@@ -44,8 +46,8 @@ from pbv.core import (
     VmTarget,
     utc_now_iso,
 )
-from pbv.orchestrator.preflight import PreflightFailure, parse_tags, preflight
-from pbv.orchestrator.sanitize import sanitize_config
+from pbv.orchestrator.preflight import parse_tags, preflight
+from pbv.orchestrator.sanitize import sanitize_config, split_privileged
 from pbv.orchestrator.signals import StopFlag
 
 log = logging.getLogger("pbv.orchestrator")
@@ -61,7 +63,7 @@ DESTROY_TIMEOUT_S = 300
 BOOT_POLL_S = 5
 CLEANUP_BACKOFF_S = (5, 15, 30)
 TASK_WAIT_CHUNK_S = 10.0
-SANITIZE_403_HINT = "token lacks privilege — hostpci/usb/args/hookscript changes need root@pam"
+SANITIZE_403_HINT = "token lacks privilege — hostpci/usb/args/hookscript changes need root@pam; configure [node_shell]"
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 
 
@@ -75,7 +77,7 @@ def exit_code(report: RunReport, *, fail_on_warn: bool = False) -> int:
     """Process exit code for a finished run (SPEC §8; 2 for config and 4 for lock are the CLI's)."""
     if report.interrupted:
         return 130
-    if any(not vm.cleanup_ok for vm in report.vms):
+    if report.sweep_failures or any(not vm.cleanup_ok for vm in report.vms):
         return 3
     if any(step.status in (Status.FAIL, Status.ERROR) for step in report.preflight):
         return 2
@@ -155,6 +157,7 @@ class Runner:
         *,
         guest_factory: Callable[[int], GuestAgent],
         console: ConsoleCapturer | None = None,
+        node_shell: NodeShell | None = None,
         run_id: str | None = None,
         should_stop: Callable[[], bool] = lambda: False,
         stop_flag: StopFlag | None = None,
@@ -170,6 +173,7 @@ class Runner:
         self.notifiers = list(notifiers)
         self.guest_factory = guest_factory
         self.console = console
+        self.node_shell = node_shell
         self.run_id = run_id or new_run_id()
         self.stop_flag = stop_flag
         self._should_stop_cb = should_stop
@@ -178,6 +182,7 @@ class Runner:
         self.log_dir = Path(log_dir) if log_dir is not None else cfg.run.log_dir
         self.tool_version = tool_version
         self.created_by_run: set[int] = set()
+        self.last_sweep_failures: list[str] = []
         self._check_warnings_logged = 0
 
     # ── small helpers ──────────────────────────────────────────────────────────
@@ -334,8 +339,13 @@ class Runner:
         raise CleanupError(f"VM {vmid} could not be destroyed after {1 + len(CLEANUP_BACKOFF_S)} attempts: {last}")
 
     def sweep(self, include_kept: bool = False) -> list[int]:
-        """Destroy tagged leftover temp VMs (never untagged ones; ``pbv-keep`` only if asked)."""
+        """Destroy tagged leftover temp VMs (never untagged ones; ``pbv-keep`` only if asked).
+
+        Returns the destroyed VMIDs. VMs that could not be destroyed are listed
+        in :attr:`last_sweep_failures` as ``"<temp vmid>: <code> <message>"``.
+        """
         swept: list[int] = []
+        self.last_sweep_failures = []
         with self._cleanup_phase():
             for vm in sorted(self.api.list_vms(), key=lambda v: int(v["vmid"])):
                 vmid = int(vm["vmid"])
@@ -349,6 +359,7 @@ class Runner:
                     self._destroy(vmid)
                 except PbvError as exc:
                     log.error("SWEEP_FAIL vmid=%d code=%s error=%s", vmid, exc.code, exc)
+                    self.last_sweep_failures.append(f"{vmid}: {exc.code} {exc}")
                     continue
                 log.info("SWEEP_OK vmid=%d", vmid)
                 swept.append(vmid)
@@ -394,8 +405,8 @@ class Runner:
     def _prepare(self, report: RunReport) -> bool:
         """Preflight and leftover sweep; False if preflight failed."""
         try:
-            report.preflight = preflight(self.api, self.cfg)
-        except PreflightFailure as exc:
+            report.preflight = preflight(self.api, self.cfg, self.node_shell)
+        except PreflightError as exc:
             report.preflight = list(exc.steps)
             return False
         except Exception as exc:  # boundary: malformed API data must still yield a report
@@ -407,6 +418,7 @@ class Runner:
         if self.cfg.run.sweep_leftovers:
             try:
                 report.leftovers_swept = self.sweep()
+                report.sweep_failures = list(self.last_sweep_failures)
             except PbvError as exc:
                 log.error("SWEEP_FAIL code=%s error=%s", exc.code, exc)
             except Exception as exc:  # boundary: a failed sweep must not prevent the run
@@ -687,13 +699,28 @@ class Runner:
         )
         for w in plan.warnings:
             log.warning("SANITIZE_WARNING vmid=%d %s", st.target.vmid, w)
-        if plan.set or plan.delete:
+        api_set, api_delete, root_set, root_delete = split = split_privileged(
+            plan, cfg, have_root=self.node_shell is not None
+        )
+        if split.root_keys and self.node_shell is None:
+            raise _Fatal(
+                "SANITIZE_NEEDS_ROOT",
+                Status.FAIL,
+                f"needs root@pam for: {', '.join(split.root_keys)} — configure [node_shell]",
+            )
+        if api_set or api_delete:
             try:
-                self.api.update_vm_config(temp, plan.set, plan.delete)
+                self.api.update_vm_config(temp, api_set, api_delete)
             except ApiError as exc:
-                if exc.status == 403:
+                if exc.status == 403 or "only root" in str(exc):
                     raise _Fatal("SANITIZE_FAIL", Status.ERROR, f"sanitize: {exc} ({SANITIZE_403_HINT})") from exc
                 raise
+        if self.node_shell is not None and (root_set or root_delete):
+            log.info("SANITIZE_ROOT vmid=%d temp=%d keys=%s", st.target.vmid, temp, ",".join(split.root_keys))
+            try:
+                self.node_shell.qm_set(temp, root_set, root_delete)
+            except PbvError as exc:
+                raise _Fatal(exc.code, Status.ERROR, f"sanitize (qm set): {exc}") from exc
         st.result.sanitized.extend([*plan.notes, *(f"WARNING: {w}" for w in plan.warnings)])
         log.info("SANITIZE_OK vmid=%d temp=%d changes=%d", st.target.vmid, temp, len(plan.notes) + len(plan.warnings))
         return f"{len(plan.notes)} change(s), {len(plan.warnings)} warning(s)"
@@ -776,10 +803,10 @@ class Runner:
             config_dir=self.cfg.config_dir,
         )
         for spec in specs:
-            self._check_stop(f"before check {spec.name}")
             res = self.checks.run(spec, st.guest, ctx)
             st.result.checks.append(res)
             log.info("CHECK vmid=%d name=%s status=%s %s", st.target.vmid, res.name, res.status.value, res.summary)
+            self._check_stop(f"after check {spec.name}")
         out = _checks_outcome(st.result.checks)
         if out.code:
             raise _Fatal(out.code, out.status, out.message)
@@ -787,7 +814,7 @@ class Runner:
 
     def _screenshot(self, st: _VmRun) -> None:
         shot = self.cfg.screenshot
-        if self.console is None or shot.mode == "off":
+        if self.console is None or not shot.enabled:
             return
         if not (shot.when == "always" or st.result.status.rank > Status.PASS.rank):
             return
@@ -907,6 +934,6 @@ def _checks_outcome(results: Sequence[CheckResult]) -> _Outcome:
 
 def _run_status(report: RunReport) -> Status:
     preflight_failed = any(s.status in (Status.FAIL, Status.ERROR) for s in report.preflight)
-    if report.interrupted or preflight_failed or any(not vm.cleanup_ok for vm in report.vms):
+    if report.interrupted or preflight_failed or report.sweep_failures or any(not vm.cleanup_ok for vm in report.vms):
         return Status.ERROR
     return Status.worst([vm.status for vm in report.vms])

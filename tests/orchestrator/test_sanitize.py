@@ -5,7 +5,8 @@ from __future__ import annotations
 import pytest
 
 from pbv.config import SanitizeConfig
-from pbv.orchestrator import SanitizePlan, sanitize_config
+from pbv.orchestrator import PRIVILEGED_KEY, PrivilegedSplit, SanitizePlan, sanitize_config, split_privileged
+from pbv.testing import fakes
 
 STORAGES = {"local-lvm", "pbs", "local"}
 
@@ -184,3 +185,82 @@ def test_notes_sorted_by_key_and_set_delete_disjoint():
     assert p.delete == sorted(p.delete) == ["args", "scsi1", "usb0"]
     assert not set(p.set) & set(p.delete)
     assert set(p.set) == {"net0", "ide2", "onboot", "agent", "vga"}
+
+
+# ── SPEC §1a: split into API and root-only parts ───────────────────────────────
+def split(cfg: dict[str, str], *, have_root: bool, **opts: object) -> PrivilegedSplit:
+    return split_privileged(plan(cfg, **opts), {"agent": "1", **cfg}, have_root=have_root)
+
+
+def test_privileged_regex_mirrors_fakes():
+    assert PRIVILEGED_KEY.pattern == fakes.PRIVILEGED_KEY.pattern
+
+
+def test_split_returns_four_parts_and_sorted_root_keys():
+    s = split(
+        {"usb1": "host=1234:5678", "hostpci0": "host=0000:01:00.0", "net0": "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0"},
+        have_root=True,
+    )
+    api_set, api_delete, root_set, root_delete = s
+    assert list(api_set) == ["net0"] and api_delete == []
+    assert root_set == {} and root_delete == ["hostpci0", "usb1"]
+    assert s.root_keys == ["hostpci0", "usb1"]
+
+
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        {"hostpci0": "mapping=gpu"},
+        {"hostpci0": "host=0000:01:00.0,pcie=1"},
+        {"usb0": "spice"},
+        {"usb0": "mapping=stick"},
+        {"parallel0": "/dev/parport0"},
+        {"virtiofs0": "share1"},
+        {"args": "-cpu host"},
+        {"hookscript": "local:snippets/h.pl"},
+        {"serial0": "/dev/ttyS0"},
+    ],
+)
+def test_with_node_shell_every_privileged_key_goes_to_root(cfg):
+    _, api_delete, root_set, root_delete = split(cfg, have_root=True)
+    assert root_delete == list(cfg) and not api_delete and not root_set
+
+
+@pytest.mark.parametrize(
+    ("cfg", "root"),
+    [
+        ({"hostpci0": "host=0000:01:00.0,pcie=1"}, True),
+        ({"hostpci1": "0000:02:00.0"}, True),  # legacy positional host
+        ({"hostpci0": "mapping=gpu,pcie=1"}, False),  # mapped: Mapping.Use suffices, try the API
+        ({"usb0": "host=1234:5678"}, True),
+        ({"usb1": "1-1.2"}, True),
+        ({"usb0": "mapping=stick"}, False),
+        ({"usb0": "spice"}, False),
+        ({"usb0": "host=spice,usb3=1"}, False),
+        ({"parallel0": "/dev/parport0"}, True),
+        ({"virtiofs0": "share1"}, True),
+        ({"args": "-cpu host"}, True),
+        ({"hookscript": "local:snippets/h.pl"}, True),
+        ({"serial0": "/dev/ttyS0"}, True),
+    ],
+)
+def test_without_node_shell_only_known_root_changes_go_to_root(cfg, root):
+    _, api_delete, root_set, root_delete = split(cfg, have_root=False)
+    assert not root_set
+    assert (root_delete, api_delete) == ((list(cfg), []) if root else ([], list(cfg)))
+
+
+@pytest.mark.parametrize("have_root", [True, False])
+def test_socket_serial_stays_on_api_side(have_root):
+    s = split({"serial0": "socket"}, have_root=have_root, keep_serial=False)
+    assert s.api_delete == ["serial0"] and s.root_keys == []
+    assert split({"serial0": "socket"}, have_root=have_root) == ({}, [], {}, [])  # kept: nothing to do
+
+
+def test_split_set_values_and_serial_device_changes():
+    p = SanitizePlan(set={"serial0": "socket", "args": "-x", "vga": "std"}, delete=["serial1"])
+    s = split_privileged(p, {"serial0": "/dev/ttyS0", "serial1": "socket"}, have_root=True)
+    assert s.api_set == {"vga": "std"} and s.api_delete == ["serial1"]
+    assert s.root_set == {"serial0": "socket", "args": "-x"} and s.root_delete == []
+    s = split_privileged(p, {"serial0": "/dev/ttyS0", "serial1": "socket"}, have_root=False)
+    assert s.root_set == {"serial0": "socket", "args": "-x"}  # device → socket is still root-only

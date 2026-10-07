@@ -13,7 +13,7 @@ import pytest
 from pbv.config import Config, parse_config
 from pbv.core import BackupRef, ExecResult, OsFamily
 from pbv.orchestrator import Runner
-from pbv.testing.fakes import FakeCheckSuite, FakeConsole, FakePve, RecordingNotifier
+from pbv.testing.fakes import FakeCheckSuite, FakeConsole, FakeNodeShell, FakePve, RecordingNotifier
 
 NOW_CTIME = 1_790_000_000
 
@@ -95,9 +95,13 @@ class Env:
     console: FakeConsole
     notifier: RecordingNotifier
     clock: FakeClock
+    node_shell: FakeNodeShell
 
     def runner(self, cfg: Config, *, notifiers: Sequence[Any] | None = None, **kw: Any) -> Runner:
+        """Runner over the fakes; ``node_shell`` defaults to the fake one when the config enables it."""
         kw.setdefault("console", self.console)
+        if cfg.node_shell.mode != "off":
+            kw.setdefault("node_shell", self.node_shell)
         kw.setdefault("run_id", "20261007T020000Z-ab12")
         kw.setdefault("sleep", self.clock.sleep)
         kw.setdefault("clock", self.clock)
@@ -118,7 +122,7 @@ class Env:
 def env(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> Env:
     caplog.set_level(logging.DEBUG, logger="pbv")
     pve = FakePve(node="restore01")
-    return Env(tmp_path, pve, FakeCheckSuite(), FakeConsole(), RecordingNotifier(), FakeClock())
+    return Env(tmp_path, pve, FakeCheckSuite(), FakeConsole(), RecordingNotifier(), FakeClock(), FakeNodeShell(pve))
 
 
 def names(calls: list[tuple[str, tuple[Any, ...]]]) -> list[str]:
