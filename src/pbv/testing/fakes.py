@@ -41,6 +41,11 @@ from pbv.core import (
     VmTarget,
 )
 
+import re
+
+# Config keys whose modification PVE 9 restricts to root@pam (non-mapped devices, host args).
+PRIVILEGED_KEY = re.compile(r"^(?:(?:hostpci|usb|serial|parallel|virtiofs)\d+|args|hookscript)$")
+
 ExecHandler = Callable[[Sequence[str], "bytes | None"], tuple[int, str, str]]
 
 
@@ -113,6 +118,7 @@ class FakePve:
         self.hung_tasks: set[str] = set()  # UPIDs whose wait_task raises PbvTimeoutError
         self.restore_hangs: set[int] = set()  # source vmids whose restore task never finishes
         self.fail_next: dict[str, ApiError] = {}  # method name -> error raised once
+        self.token_is_root = False  # PVE 9: tokens are never root@pam; privileged keys and screendump refused
         self.restore_fails: dict[int, str] = {}  # source vmid -> task exitstatus
         self.destroy_fails: set[int] = set()  # temp vmids whose destroy task fails
         self._upid = itertools.count(1)
@@ -257,6 +263,12 @@ class FakePve:
         overlap = set(set_) & set(delete)
         if overlap:
             raise ApiError(f"cannot set and delete the same option(s): {sorted(overlap)}", status=400)
+        if self.token_is_root is False:
+            for k in [*set_, *delete]:
+                if PRIVILEGED_KEY.match(k) and not (
+                    k.startswith("serial") and set_.get(k, vm.config.get(k)) == "socket"
+                ):
+                    raise ApiError(f"only root can modify '{k}' config for real devices", status=500)
         vm.config.update(set_)
         for k in delete:
             vm.config.pop(k, None)
@@ -397,6 +409,8 @@ class FakePve:
     def monitor(self, vmid: int, command: str) -> str:
         self._record("monitor", vmid, command)
         self._running(vmid)
+        if self.token_is_root is False and command.strip().startswith("screendump"):
+            raise ApiError("root-only command 'screendump'", status=500)
         self.monitor_log.append((vmid, command))
         return ""
 
@@ -453,6 +467,37 @@ class FakeGuest:
 
     def ip_addresses(self) -> list[str]:
         return list(self._ips)
+
+
+class FakeNodeShell:
+    """:class:`pbv.core.NodeShell` that applies ``qm set`` to a :class:`FakePve`."""
+
+    def __init__(self, pve: FakePve | None = None, *, fail: bool = False) -> None:
+        self.pve = pve
+        self.fail = fail
+        self.qm_calls: list[tuple[int, dict[str, str], list[str]]] = []
+        self.screendumps: list[int] = []
+
+    def qm_set(self, vmid: int, set_: Mapping[str, str], delete: Sequence[str]) -> None:
+        from pbv.core import PbvError
+
+        self.qm_calls.append((vmid, dict(set_), list(delete)))
+        if self.fail:
+            raise PbvError("node shell: ssh exited 255", code="NODE_SHELL_FAIL")
+        if self.pve is not None:
+            vm = self.pve._vm(vmid)
+            vm.config.update(set_)
+            for k in delete:
+                vm.config.pop(k, None)
+
+    def screendump(self, vmid: int, dest: Path) -> Path | None:
+        self.screendumps.append(vmid)
+        if self.fail:
+            return None
+        p = dest.with_suffix(".png")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"\x89PNG\r\n\x1a\n")
+        return p
 
 
 class FakeConsole:

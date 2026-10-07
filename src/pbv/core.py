@@ -417,6 +417,25 @@ class GuestAgent(Protocol):
 
 
 @runtime_checkable
+class NodeShell(Protocol):
+    """Root shell on the restore node, for operations PVE 9 restricts to ``root@pam``.
+
+    API tokens are never ``root@pam``, so these go through ``qm`` as root, either
+    locally (pbv runs on the restore node) or over SSH (``pbv.pve.NodeShellRunner``).
+    Needed for: removing non-mapped ``hostpci``/``usb`` devices, real-device
+    ``serial``/``parallel`` ports, ``args``/``hookscript``; and HMP
+    ``screendump`` (root-only in PVE 9).
+    """
+
+    def qm_set(
+        self, vmid: int, set_: Mapping[str, str], delete: Sequence[str]
+    ) -> None: ...  # raises PbvError(code="NODE_SHELL_FAIL")
+    def screendump(
+        self, vmid: int, dest: Path
+    ) -> Path | None: ...  # dest without suffix; returns local PNG path; never raises
+
+
+@runtime_checkable
 class ConsoleCapturer(Protocol):
     """Takes a screenshot of a VM's VGA console (``pbv.pve.ConsoleCapture``)."""
 

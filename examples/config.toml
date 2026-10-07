@@ -49,14 +49,23 @@ selection = "listed"                       # "listed" = [[vm]] below; "all" = ev
 exclude = []
 default_mode = "hybrid"                    # auto | hybrid | manual
 
-[screenshot]
-mode = "local"                             # off | local (pbv runs ON the restore node) | ssh
-when = "failure"                           # failure | always
+[node_shell]
+# PVE 9 lets ONLY root@pam (never an API token) remove non-mapped PCI/USB passthrough,
+# real serial/parallel ports, args and hookscript, and run the HMP `screendump`.
+# pbv does those few operations with `qm` as root on the restore node:
+#   local = pbv runs on the restore node as root; ssh = via ssh to root@restore node.
+# With mode = "off", VMs that need such changes fail with SANITIZE_NEEDS_ROOT.
+mode = "ssh"
+ssh_host = "pbv-restore01.lab.example"
+ssh_user = "root"
+ssh_key_file = "secrets/id_ed25519"
+ssh_known_hosts_file = "known_hosts"     # pin the node's host key (StrictHostKeyChecking=yes)
 remote_dir = "/var/lib/pbv/screendump"
-# ssh_host = "pbv-restore01.lab.example"   # for mode = "ssh"
-# ssh_user = "root"
-# ssh_key_file = "secrets/id_ed25519"
-# ssh_known_hosts_file = "known_hosts"
+timeout_s = 60
+
+[screenshot]
+enabled = true                             # console screenshots (needs node_shell)
+when = "failure"                           # failure | always
 
 [notify.json]
 enabled = true

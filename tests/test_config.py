@@ -33,7 +33,8 @@ def test_example_config_loads(tmp_path, monkeypatch):
     d.mkdir()
     (d / "config.toml").write_text(EXAMPLE.read_text())
     (d / "secrets").mkdir()
-    for n in ("pve-token", "smtp-password"):
+    (d / "known_hosts").write_text("")
+    for n in ("pve-token", "smtp-password", "id_ed25519"):
         (d / "secrets" / n).write_text("x")
         (d / "secrets" / n).chmod(0o600)
     (d / "scripts").mkdir()
@@ -52,6 +53,8 @@ def test_example_config_loads(tmp_path, monkeypatch):
     assert cfg.global_checks[0].only_os is OsFamily.LINUX
     assert cfg.temp_vmid(105) == 900105 and vm105.temp_vmid == 900105
     assert cfg.notify.json.when is NotifyWhen.ALWAYS
+    assert cfg.node_shell.mode == "ssh" and cfg.node_shell.ssh_key_file == str(d / "secrets" / "id_ed25519")
+    assert cfg.screenshot.enabled
 
 
 def test_minimal_defaults(tmp_path):
@@ -109,7 +112,9 @@ def test_vm_target_default_for_unlisted(tmp_path):
         (lambda r: r.update(vm=[]), "no [[vm]]"),
         (lambda r: r.update(notify={"email": {"enabled": True}}), "notify.email"),
         (lambda r: r.update(notify={"ntfy": {"enabled": True, "topic": "bad topic"}}), "topic"),
-        (lambda r: r.update(screenshot={"mode": "ssh"}), "ssh_host"),
+        (lambda r: r.update(node_shell={"mode": "ssh"}), "ssh_host"),
+        (lambda r: r.update(screenshot={"enabled": True}), "node_shell"),
+        (lambda r: r.update(node_shell={"mode": "local", "remote_dir": "rel"}), "absolute"),
         (lambda r: r.update(run={"selection": "some"}), "must be one of"),
     ],
 )

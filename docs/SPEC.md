@@ -50,6 +50,39 @@ that can reach the restore node's API on port 8006.
 - Restored VMs are tagged, described, and get `onboot=0` and
   `protection` removed in the very first config update after restore.
 
+### 1a. root-only operations (contract amendment, decided after wave 1 launch)
+
+Verified against the qemu-server source (master, `src/PVE/API2/Qemu.pm`,
+`HMPPerms.pm`). For anyone other than `root@pam`, and an API token is never
+`root@pam`:
+- Changing or deleting `hostpci*` with `host=` (non-mapped) dies with "only
+  root can set … for non-mapped devices". `usb*` is the same for non-mapped
+  devices. Changing `serial*` to or from a real device is root-only. `args`
+  and `hookscript` are root-only.
+- HMP `screendump` has permission `root` ("dump to arbitrary target file"),
+  so the API monitor call fails for tokens on PVE 9.
+
+These operations therefore go through a `pbv.core.NodeShell`
+(`[node_shell] mode = off|local|ssh`). In `local` mode pbv runs `qm` as root
+on the restore node itself; in `ssh` mode it uses
+`ssh -o BatchMode=yes -o StrictHostKeyChecking=yes root@node`.
+- Sanitize splits its plan into `api` keys (everything else) and `root` keys
+  (matching `pbv.testing.fakes.PRIVILEGED_KEY`, except `serial*` values that
+  are `socket` both before and after). The api part is one `update_vm_config`;
+  the root part is one `NodeShell.qm_set`. If there are root keys and
+  node_shell is off → `SANITIZE_NEEDS_ROOT` (FAIL), with the message listing
+  the keys and pointing at `[node_shell]`.
+- Screenshots use `NodeShell.screendump` (which runs `qm monitor <vmid>` with
+  `screendump <remote_dir>/x.png -f png`, then copies the file back with scp
+  in ssh mode, or moves it in local mode). `[screenshot] enabled` requires
+  node_shell. `ScreenshotConfig` is now only `enabled` + `when`, and the
+  ssh/remote_dir fields moved to `NodeShellConfig`.
+- `qm set` is run as `qm set <vmid> --<k> <v> ... --delete k1,k2`, every
+  argument shlex-quoted for the remote shell. A non-zero exit →
+  `PbvError(code="NODE_SHELL_FAIL")` with the last stderr line (≤ 200 chars).
+- Preflight adds a `node_shell` step when mode != off: run `true` (ssh) or
+  check `os.geteuid() == 0` and `shutil.which("qm")` (local).
+
 ## 2. Lifecycle per VM (sequential; one VM at a time)
 
 Each step yields a `StepResult` (`name`, `status`, `duration_s`, `message`,
@@ -328,7 +361,8 @@ opener=None)` implements `PveApi`.
   maps osinfo `id == "mswindows"` → WINDOWS, any other non-empty id → LINUX,
   and returns UNKNOWN otherwise. `ip_addresses` skips loopback and link-local
   and returns IPv4 first.
-- `ConsoleCapture(api, *, mode, remote_dir, local_dir, ssh_host, ssh_user,
+- (Superseded by §1a: screendump goes through NodeShell. ConsoleCapture
+  wraps a NodeShell.) `ConsoleCapture(api, *, mode, remote_dir, local_dir, ssh_host, ssh_user,
   ssh_port, ssh_key_file, ssh_known_hosts_file, run=subprocess.run)`. It runs
   HMP `screendump <remote_dir>/<name>.png -f png` through `monitor`. In mode
   `local` it moves the file. In mode `ssh` it fetches the file with `scp`

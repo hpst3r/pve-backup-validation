@@ -84,15 +84,23 @@ class RunConfig:
 
 
 @dataclass(frozen=True)
-class ScreenshotConfig:
-    mode: str = "off"  # "off" | "local" | "ssh"
-    when: str = "failure"  # "failure" | "always"
-    remote_dir: str = "/var/lib/pbv/screendump"
+class NodeShellConfig:
+    """Root shell on the restore node for root@pam-only operations (see core.NodeShell)."""
+
+    mode: str = "off"  # "off" | "local" (pbv runs on the restore node as root) | "ssh"
     ssh_host: str = ""
     ssh_user: str = "root"
     ssh_port: int = 22
     ssh_key_file: str = ""
     ssh_known_hosts_file: str = ""
+    remote_dir: str = "/var/lib/pbv/screendump"  # where screendump writes on the node
+    timeout_s: int = 60
+
+
+@dataclass(frozen=True)
+class ScreenshotConfig:
+    enabled: bool = False  # requires node_shell.mode != "off" (screendump is root-only in PVE 9)
+    when: str = "failure"  # "failure" | "always"
 
 
 @dataclass(frozen=True)
@@ -166,6 +174,7 @@ class Config:
     restore: RestoreConfig
     sanitize: SanitizeConfig
     run: RunConfig
+    node_shell: NodeShellConfig
     screenshot: ScreenshotConfig
     notify: NotifyConfig
     vms: tuple[VmTarget, ...]
@@ -570,21 +579,30 @@ def parse_config(raw: Mapping[str, Any], path: Path) -> Config:
     )
     ru.finish()
 
+    ns = sect("node_shell")
+    node_shell = NodeShellConfig(
+        mode=ns.str("mode", "off", choices=("off", "local", "ssh")),
+        ssh_host=ns.str("ssh_host", ""),
+        ssh_user=ns.str("ssh_user", "root"),
+        ssh_port=ns.int("ssh_port", 22, lo=1, hi=65535),
+        ssh_key_file=str(_resolve(base, k)) if (k := ns.str("ssh_key_file", "")) else "",
+        ssh_known_hosts_file=str(_resolve(base, k)) if (k := ns.str("ssh_known_hosts_file", "")) else "",
+        remote_dir=ns.str("remote_dir", "/var/lib/pbv/screendump"),
+        timeout_s=ns.int("timeout_s", 60, lo=5, hi=3600),
+    )
+    if node_shell.mode == "ssh" and not node_shell.ssh_host:
+        raise ConfigError('node_shell.ssh_host: required when mode = "ssh"')
+    if not node_shell.remote_dir.startswith("/"):
+        raise ConfigError("node_shell.remote_dir: must be an absolute path on the restore node")
+    ns.finish()
+
     sc = sect("screenshot")
     shot = ScreenshotConfig(
-        mode=sc.str("mode", "off", choices=("off", "local", "ssh")),
+        enabled=sc.bool("enabled", False),
         when=sc.str("when", "failure", choices=("failure", "always")),
-        remote_dir=sc.str("remote_dir", "/var/lib/pbv/screendump"),
-        ssh_host=sc.str("ssh_host", ""),
-        ssh_user=sc.str("ssh_user", "root"),
-        ssh_port=sc.int("ssh_port", 22, lo=1, hi=65535),
-        ssh_key_file=str(_resolve(base, k)) if (k := sc.str("ssh_key_file", "")) else "",
-        ssh_known_hosts_file=str(_resolve(base, k)) if (k := sc.str("ssh_known_hosts_file", "")) else "",
     )
-    if shot.mode == "ssh" and not shot.ssh_host:
-        raise ConfigError('screenshot.ssh_host: required when mode = "ssh"')
-    if not shot.remote_dir.startswith("/"):
-        raise ConfigError("screenshot.remote_dir: must be an absolute path on the target node")
+    if shot.enabled and node_shell.mode == "off":
+        raise ConfigError('screenshot.enabled: needs node_shell.mode = "local" or "ssh" (screendump is root-only)')
     sc.finish()
 
     notify = _parse_notify(sect("notify"), base)
@@ -652,6 +670,7 @@ def parse_config(raw: Mapping[str, Any], path: Path) -> Config:
         restore=restore,
         sanitize=sanitize,
         run=run,
+        node_shell=node_shell,
         screenshot=shot,
         notify=notify,
         vms=tuple(vms),
