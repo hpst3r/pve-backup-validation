@@ -1,342 +1,161 @@
-# Proxmox Backup Validation
+# pbv — Proxmox Backup Validation
 
-Automated **test restores** of Proxmox Backup Server (PBS) backups into isolated VMs. For each VM it restores the latest backup, boots it on an isolated bridge, validates **boot → systemd services → TCP ports → HTTP endpoints**, sends a Telegram report, and destroys the temporary VM.
+Automated **test restores** of Proxmox Backup Server (PBS) backups, in the
+spirit of Veeam SureBackup. For each configured VM, pbv:
 
-Service checks (TCP/HTTP) run **inside the guest** via the QEMU guest agent, so they work even on a fully isolated bridge with no route and no DHCP.
+1. finds the newest backup on the PBS storage,
+2. restores it to a temporary VM on a **separate, standalone restore node**
+   (never your production cluster),
+3. sanitizes the config: moves every NIC to an isolated bridge, removes
+   PCI/USB passthrough and host devices, ejects ISOs, drops host-specific
+   options, and enables the guest agent,
+4. boots it and waits for the QEMU guest agent,
+5. runs checks inside the guest: systemd / Windows services, listening ports,
+   HTTP endpoints, log scans, **arbitrary commands and uploaded scripts**
+   (sh / PowerShell / cmd), plus scripts on the runner itself,
+6. reports by **email**, **ntfy**, a **JSON report** and (optionally)
+   Telegram, with a console screenshot on failure,
+7. destroys the temporary VM, retrying and verifying, and loudly reports
+   anything it could not remove.
 
-> Designed for clusters **without shared storage** (no Ceph): restores pull from > PBS, so a single "test node" can validate VMs from any node in the cluster.
+This is a Python rewrite of [Tobidp/pve-backup-validation](https://github.com/Tobidp/pve-backup-validation)
+(bash, MIT). The original script is kept in [`legacy/`](legacy/). The
+authoritative design document is [`docs/SPEC.md`](docs/SPEC.md).
 
-## Features
+> **Status:** unit- and fake-tested only. It has not yet been run against a
+> real Proxmox VE node. Treat the first real runs as supervised acceptance
+> tests.
 
-- 🔁 Latest-snapshot test restore per VM, then automatic teardown
-- 🧪 Validates boot, systemd units, listening ports and HTTP endpoints
-- 🔍 Service **auto-discovery** from a signature library (+ manual overrides)
-- 🔒 Isolated bridge, firewall disabled on the test NIC, NIC config preserved
-- 🛡️ Single-run lock (`flock`) and cleanup on interruption (`INT`/`TERM`)
-- 📨 Telegram notifications (success / failure / summary)
-- 📸 On boot failure, a **console screenshot** is attached to the Telegram alert
-  (lets you see GRUB / kernel panic / fsck / emergency shell at a glance)
-- 🗂️ Per-run, per-VM log files
-
-## How it works
-
-For each VMID listed in `backup_validation.conf`, the script runs this flow on
-the PVE node:
+## Topology
 
 ```
-backup_validation.conf                 PBS datastore (storage "pbs")
-  105 ; auto   ;        ─┐
-  110 ; hybrid ; ...     │   per VMID
-  210 ; manual ; ...     │
-                         ▼
-       ┌─────────────────────────────────┐
-       │ 1. List backups in PBS          │  pvesh get .../storage/pbs/content
-       │ 2. Filter by VMID, content=backup│  keep vmid == 105
-       │ 3. Pick the NEWEST (by ctime)   │  → volid of the latest snapshot
-       └────────────────┬────────────────┘
-                        ▼
-       ┌─────────────────────────────────┐
-       │ 4. Restore to a TEMP VMID       │  qmrestore <volid> 9105 --unique
-       │    (prefix + VMID, e.g. 105→9105)│
-       └────────────────┬────────────────┘
-                        ▼
-       ┌─────────────────────────────────┐
-       │ 5. Isolate NIC → vmbr99         │  swap bridge, firewall off
-       │ 6. Boot + wait for guest agent  │
-       └────────────────┬────────────────┘
-                        ▼
-       ┌─────────────────────────────────┐
-       │ 7. Validate INSIDE the guest    │  systemd / TCP / HTTP / custom
-       │    boot, services, ports        │
-       └────────────────┬────────────────┘
-                        ▼
-       ┌─────────────────────────────────┐
-       │ 8. Telegram report (OK / FAIL)  │  + console screenshot on boot fail
-       │ 9. Destroy the temp VM          │  qm destroy 9105 --purge
-       └─────────────────────────────────┘
+production cluster ──backup──▶ PBS ◀──read (PBS storage)── restore node (standalone PVE)
+                                                             │  vmbr-pbv: no ports, no IP
+pbv runner ──HTTPS API token (+ optional root SSH)───────────┘  temp VMs 900000+<vmid>
 ```
 
-Key points:
+pbv talks only to the restore node. Before it creates anything, preflight
+refuses to run if:
 
-- The source production VM is **only read** — its newest PBS backup is restored
-  into a separate temporary VMID (`TEMP_VMID_PREFIX` + the original VMID, e.g.
-  `105` → `9105`). Production is never touched.
-- "Newest" is decided by the backup's creation time (`ctime`); older snapshots
-  are not tested.
-- The temporary VM is always destroyed at the end (and on interruption). See
-  [Safety](#safety-how-it-avoids-touching-production).
+- the node is part of a cluster (`require_standalone`, default on), or its
+  cluster name is in `forbid_cluster_names`;
+- the isolated bridge has ports or an IP address;
+- the backup storage is not of type `pbs`, or the target storage can't hold
+  images;
+- the temporary VMID range contains a VM pbv didn't tag.
 
-## Requirements
+Temporary VMs are `temp_vmid_base + vmid` (default `900000 + vmid`) and carry
+the `pbv-temp` tag. Before every stop or destroy, pbv checks the VMID range
+and either the tag or the fact that this run created the VM.
 
-**On the PVE node (where the script runs):**
+### Why there's a root shell option
+
+On PVE 9, only `root@pam` may remove non-mapped PCI/USB passthrough, change
+real serial/parallel devices, `args` or `hookscript`, or run the `screendump`
+monitor command, and API tokens are never `root@pam`. pbv does just those
+operations with `qm` through `[node_shell]`: either locally (pbv runs on the
+restore node as root) or over SSH with a pinned host key. Without it, VMs
+that need such changes fail with `SANITIZE_NEEDS_ROOT`, and screenshots are
+unavailable.
+
+### Disk space
+
+Every test is a full restore, so it needs scratch space on `target_storage`
+equal to the VM's disk size. VMs are tested one at a time, and pbv checks free
+space first (`min_free_space_ratio`).
+
+## Install
+
+On the runner (the restore node itself, or any Linux host that can reach
+it):
 
 ```bash
-which qm qmrestore pvesh python3 flock curl
-apt install -y curl    # if curl is missing (used for Telegram)
-
-# Optional: only needed to convert console screenshots to PNG on boot failures,
-# and only if your QEMU can't write PNG directly (PVE 8+ usually can).
-apt install -y netpbm  # provides pnmtopng (or use imagemagick's `convert`)
+python3 -m venv /opt/pbv/venv
+/opt/pbv/venv/bin/pip install git+https://github.com/hpst3r/pve-backup-validation
+install -d -m 750 /etc/pbv /etc/pbv/secrets /var/lib/pbv /var/log/pbv
+cp examples/config.toml /etc/pbv/config.toml   # then edit
 ```
 
-**On each Linux guest to be validated:**
+On the restore node, as root, review and then run
+[`deploy/setup-restore-node.sh`](deploy/setup-restore-node.sh). It creates
+the isolated bridge and the `pbv@pve` user, role and API token. Add the
+production PBS datastore as a storage first, preferably with a PBS user that
+only has `DatastoreReader`, and the encryption key if your backups are
+encrypted.
 
 ```bash
-apt install -y qemu-guest-agent
-systemctl enable --now qemu-guest-agent
-# For HTTP checks, the guest also needs curl or wget (optional)
+pbv check-config
+pbv preflight
+pbv list-backups
+pbv run --vmid 105 --dry-run
+pbv run --vmid 105
+cp deploy/pbv.service deploy/pbv.timer /etc/systemd/system/ && systemctl enable --now pbv.timer
 ```
 
-On the PVE node, make sure the agent is enabled in the VM config:
+## Configuration
+
+See the annotated [`examples/config.toml`](examples/config.toml). Secrets are
+only accepted through `*_file` (must not be world-readable) or `*_env`.
+
+Per VM, `mode` decides which checks run:
+
+| mode | checks |
+|---|---|
+| `auto` | discovered services (Linux: nginx, apache, postgres, mariadb, redis, sshd, …; Windows: IIS, SQL Server, AD DS, DNS, RDP, SMB) |
+| `hybrid` | your `[[vm.check]]` entries plus discovered ones |
+| `manual` | only your `[[vm.check]]` entries |
+
+`[[global_check]]` entries apply to every VM; use `os = "linux"` or
+`os = "windows"` to filter them.
+
+### Check types
+
+| type | what it does |
+|---|---|
+| `systemd` | `systemctl is-active <unit>`; on failure, includes the status and the journal tail |
+| `windows_service` | `Get-Service` status is `Running` |
+| `tcp_listen` | socket listening on the port inside the guest (`ss`/`netstat`, `Get-NetTCPConnection`) |
+| `http` | request from inside the guest (curl/wget, `Invoke-WebRequest`), checking status and an optional body regex |
+| `command` | runs an argv in the guest; checks the exit code and an optional stdout regex |
+| `script` | **uploads a local script** into the guest and runs it (`.sh` via `/bin/sh` or your interpreter; `.ps1`/`.cmd`/`.bat` on Windows) |
+| `host_script` | runs a script **on the runner**, with the guest's IPs and other facts in the environment |
+| `log_scan` | counts error lines in a unit's journal, minus ignore patterns |
+
+Every check accepts `critical` (false → WARN instead of FAIL), `timeout_s`,
+`wait_s` (keep retrying until the service comes up), `os` and `name`.
+Scripts receive `PBV_RUN_ID`, `PBV_VMID`, `PBV_TEMP_VMID`, `PBV_VM_NAME`,
+`PBV_OS`, `PBV_GUEST_IP(S)`, `PBV_TARGET_NODE` and `PBV_CHECK_NAME`, plus the
+check's `env` table. Host scripts also get `PBV_WORK_DIR` for artifacts.
+Guest scripts are limited to 45 KiB by the guest-agent file-write size.
+
+Guests need `qemu-guest-agent` installed and running. Linux HTTP checks need
+curl or wget; without either, pbv falls back to a port check and reports
+WARN.
+
+## Exit codes
+
+| code | meaning |
+|---|---|
+| 0 | all VMs passed (WARN allowed unless `run.fail_on_warn`) |
+| 1 | at least one VM failed or errored |
+| 2 | config or preflight error; nothing was restored |
+| 3 | **a temporary VM could not be removed**; manual cleanup needed (takes precedence over 1) |
+| 4 | another pbv run holds the lock |
+| 130 | interrupted (cleanup still ran) |
+
+The JSON report (`notify.json.dir`, plus `latest.json`) is written on every
+run. It is meant for monitoring; see SPEC §7 for the stable fields.
+
+## Development
 
 ```bash
-qm set <VMID> --agent enabled=1
+uv venv -p 3.11 .venv && uv pip install -p .venv -e '.[dev]'
+.venv/bin/python -m pytest -q
+.venv/bin/ruff check src tests && .venv/bin/ruff format --check src tests
 ```
 
-## 1. Create the isolated bridge
-
-Edit `/etc/network/interfaces`:
-
-```
-auto vmbr99
-iface vmbr99 inet manual
-    bridge-ports none
-    bridge-stp off
-    bridge-fd 0
-    # No gateway, no route — fully isolated
-```
-
-Apply and verify:
-
-```bash
-ifreload -a
-ip link show vmbr99
-```
-
-> **DHCP is NOT required.** Since checks run inside the guest, the test VM does
-> not need an IP on the isolated bridge. The guest IP, when available, is only
-> shown in the report ("Test IP"). If you *want* an IP shown, you can optionally
-> run dnsmasq on `vmbr99` — but it is purely cosmetic.
-
-## 2. Install the script and config
-
-The script reads everything from `/root` by default:
-
-```bash
-cp backup_validation.sh /root/
-chmod +x /root/backup_validation.sh
-
-cp backup_validation.conf.example /root/backup_validation.conf         # edit it
-cp backup_validation.env.example  /root/backup_validation.env          # edit it
-chmod 600 /root/backup_validation.env                                  # contains secrets
-```
-
-> Save all files with **LF** (Unix) line endings. CRLF is tolerated for the
-> `.conf`/`.env`, but the `.sh` must be LF or the shebang breaks.
-
-## 3. Configure secrets (Telegram)
-
-Secrets and per-node overrides live in `backup_validation.env` (sourced at
-runtime), **not** in the script:
-
-```bash
-TELEGRAM_TOKEN="your_token_here"
-TELEGRAM_CHAT_ID="your_chat_id_here"
-# Optional — send to a specific topic of a forum supergroup:
-#TELEGRAM_THREAD_ID="123"
-```
-
-`TELEGRAM_THREAD_ID` is the `message_thread_id` of a topic inside a Telegram
-group with topics (forum supergroup). Leave it empty to post to the main chat.
-
-Any default from the script can be overridden here (storage names, timeouts,
-paths, bridge, etc.). Leave Telegram empty to disable notifications.
-
-## 4. Configure the VM list
-
-Edit `/root/backup_validation.conf`. One VM per line, `;`-separated:
-
-```
-# vmid ; mode   ; overrides
-105    ; auto   ;
-110    ; hybrid ; cloudflared:0
-210    ; manual ; myapp:8080
-```
-
-## 5. Run
-
-```bash
-# Full cycle (all VMs in the config file)
-/root/backup_validation.sh
-
-# One-off test of a single VM
-/root/backup_validation.sh --vmid 105
-/root/backup_validation.sh --vmid 105 --mode hybrid --overrides "cloudflared:0"
-/root/backup_validation.sh --vmid 105 --mode manual --overrides "myapp:8080"
-```
-
-Logs are written to `/var/log/backup_validation/<MM-DD-YY_HHhMM>/`:
-
-```
-/var/log/backup_validation/06-09-26_02h00/
-  ├── _cycle.log        # cycle-level: pre-checks, summary
-  ├── 105/105.log       # per-VM test log
-  └── 110/110.log
-```
-
-## 6. Schedule via cron
-
-```bash
-# Weekly, Sundays at 02:00
-cat > /etc/cron.d/backup-validation <<'EOF'
-0 2 * * 0 root /root/backup_validation.sh
-EOF
-```
-
-## Operating modes
-
-| Mode | Use | Example line |
-|------|-----|--------------|
-| `auto` | Default services from the signature library | `100;auto;` |
-| `hybrid` | Auto-discovery + custom services | `101;hybrid;api:8080` |
-| `manual` | Custom services only | `102;manual;myapp:9000` |
-
-Override format: `service:port,service:port`. Use `port 0` to skip the port/HTTP
-check and validate only the systemd unit (e.g. `cloudflared:0`).
-
-## Built-in signature library
-
-| Service | Check |
-|---------|-------|
-| Apache (`apache2`/`httpd`) | HTTP/80 |
-| Nginx | HTTP/80 |
-| PostgreSQL | TCP/5432 |
-| MariaDB/MySQL | TCP/3306 |
-| Redis | TCP/6379 |
-| MongoDB | TCP/27017 |
-| ClickHouse | TCP/9000 |
-| Docker | systemd only |
-| Elasticsearch | HTTP/9200 |
-| RabbitMQ | TCP/5672 |
-| cloudflared | systemd + log scan |
-
-## How checks work
-
-Each signature has the form `PORT:PROTOCOL:ENDPOINT`. The **PROTOCOL** field
-decides which validation runs after the always-on systemd check:
-
-| Protocol | Validation | What it checks |
-|----------|------------|----------------|
-| (any) | `check_systemd` | The unit reports `active` (always runs first) |
-| `tcp` | `check_tcp_guest` | A socket is in `LISTEN` on the port (`ss -ltn`, inside the guest) |
-| `http` / `https` | `check_http_guest` | A request to `127.0.0.1:PORT` returns a valid HTTP code |
-| `none` | — | systemd only (no port to probe, e.g. Docker) |
-| `custom_*` | custom function | Service-specific logic (see below) |
-
-All network checks run **inside the guest** via the QEMU guest agent, so they
-work regardless of guest networking, DHCP or routing.
-
-### Failure diagnostics
-
-When a check fails, the report tells you *what* went wrong, not just *that* it did:
-
-- **HTTP:** the actual status code is shown in the alert (e.g. `✗ HTTP 80 (nginx)
-  [500]`) and appended to the reason (`HTTP_FAIL_nginx_80_500`).
-- **systemd:** the unit state and reason are shown (e.g. `✗ systemd: nginx
-  [failed — ActiveState=failed SubState=failed Result=exit-code]`), and the full
-  `systemctl status` + last 15 journal lines are written to the per-VM log.
-- **Boot:** a console screenshot is attached to the Telegram alert (see Features).
-
-### Why cloudflared is a special case
-
-`cloudflared` (Cloudflare Tunnel) opens **no local listening port** — it makes
-outbound connections to Cloudflare's edge. So TCP/HTTP probing makes no sense.
-Instead, `check_cloudflared` inspects `journalctl -u cloudflared` and counts only
-**critical** errors. Because the test VM runs on an isolated bridge with no
-internet, connectivity errors are *expected* and are filtered out
-(`network is unreachable`, `no such host`, `dial tcp`, `context deadline`) — only
-real problems (bad config, invalid credentials, parse errors) cause a failure.
-
-### Adding your own custom check
-
-The `custom_*` protocol is an extension hook. To validate a service that doesn't
-fit the port/HTTP model (a queue worker, a backup daemon, etc.):
-
-1. Add a signature with a `custom_<name>` protocol (port `0`):
-   ```bash
-   ["myservice"]="0:custom_myservice:"
-   ```
-2. Write a `check_myservice()` function (use `guest_exec` to run commands inside
-   the guest, mirroring `check_cloudflared`).
-3. Route it in step **7.2** of `process_vm()`:
-   ```bash
-   case "$proto" in
-       custom_cloudflared) ... ;;
-       custom_myservice)
-           if check_myservice "$temp_vmid"; then
-               checks="${checks}  ✓ My check (${svc})\n"
-           else
-               checks="${checks}  ✗ My check (${svc})\n"
-               final_result="FAIL"; failure_reason="MYSERVICE_FAIL_${svc}"
-           fi
-           ;;
-   esac
-   ```
-
-## Safety: how it avoids touching production
-
-The whole safety model rests on **VMID separation**. The script never deletes a
-production VM because:
-
-- **Production and test IDs never cross.** The source VMID (e.g. `105`) is only
-  *read* (its PBS backup is restored). The restore writes to a separate temporary
-  VMID built as `TEMP_VMID_PREFIX` + the original VMID (e.g. `105` → `9105`).
-  `qm stop` and `qm destroy` are **only ever called with the temporary VMID**.
-- **The source VM is never started, stopped or destroyed** — only its backup is read.
-- **It refuses to reuse an existing VMID.** Before restoring, it checks whether
-  the temporary VMID already exists; if so it aborts/skips (`TEMP_VMID_BUSY`)
-  instead of overwriting or deleting. So it only ever destroys a VM **it created
-  itself** at a free VMID.
-- **Hard guard in cleanup.** `cleanup_vm` refuses to destroy any VMID that does
-  not match the temp scheme (`TEMP_VMID_PREFIX` + a real VMID) — even a bug or
-  misconfiguration cannot make it touch a production ID.
-- **Visible marker.** The test VM is tagged `backup-validation-temp` with a
-  "safe to delete" description, so it is obvious in `qm list` / the web UI.
-
-> ⚠️ Note: the restored test VM inherits the **production VM's name** (the full
-> config is restored). The name is therefore *not* a safe discriminator — only
-> the VMID is. Make sure the prefixed IDs can't collide with real VMs — e.g. with
-> the default prefix `9`, avoid having a production VM `9105` while testing `105`.
-> Keeping production VMIDs in the 100–999 range (Proxmox's convention) avoids this.
-
-## Troubleshooting
-
-**Guest agent not responding**
-- Check `systemctl status qemu-guest-agent` inside the VM
-- Confirm `qm set <VMID> --agent enabled=1` on the original VM
-
-**HTTP check fails but the service is up**
-- The check runs against `127.0.0.1` inside the guest. If the service binds to a
-  specific interface (not `0.0.0.0`/localhost), use a `tcp` override instead —
-  the TCP check uses `ss -ltn` and matches any listen address.
-
-**Temporary VMID busy**
-- Look for leftovers: `qm list | grep '^ *900'`
-- Clean up manually: `qm destroy <VMID> --purge 1`
-
-**Restore fails**
-- Check destination storage: `pvesm status`
-- Check free space: `df -h`
-
-**Another run in progress**
-- A `flock` prevents overlapping runs. If a previous run is still going (long
-  restore), the new one aborts. Lock file: `/var/lock/backup_validation.lock`.
-
-## Author
-
-**Tobias Pandolfo** ([@Tobidp](https://github.com/Tobidp)) — [LinkedIn](https://www.linkedin.com/in/tobiaspandolfo/)
+Runtime dependencies: none (stdlib only, Python ≥ 3.11).
 
 ## License
 
-[MIT](LICENSE) © 2026 Tobias Pandolfo.
-Free to use and modify, as long as the original copyright notice is kept.
+MIT. Original bash implementation © 2026 Tobias Pandolfo; see [LICENSE](LICENSE).

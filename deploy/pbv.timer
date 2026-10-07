@@ -1,0 +1,10 @@
+[Unit]
+Description=Run pbv backup validation nightly (after backups finish)
+
+[Timer]
+OnCalendar=*-*-* 06:30:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

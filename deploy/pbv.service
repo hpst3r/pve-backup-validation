@@ -1,0 +1,23 @@
+[Unit]
+Description=pbv: automated Proxmox backup test restores
+Documentation=https://github.com/hpst3r/pve-backup-validation
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Exit codes: 0 pass, 1 VM fail/error, 2 config/preflight, 3 cleanup failure, 4 locked, 130 interrupted.
+ExecStart=/opt/pbv/venv/bin/pbv -c /etc/pbv/config.toml run
+SuccessExitStatus=1
+# Give in-flight cleanup time to destroy the temporary VM after SIGTERM.
+TimeoutStopSec=15min
+KillMode=mixed
+Nice=10
+IOSchedulingClass=idle
+# Hardening (pbv needs network, its state/log dirs, and ssh for node_shell = "ssh").
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ReadWritePaths=/var/lib/pbv /var/log/pbv /run/lock
+UMask=0027
