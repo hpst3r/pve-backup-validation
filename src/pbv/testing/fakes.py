@@ -478,6 +478,13 @@ class FakeNodeShell:
         self.qm_calls: list[tuple[int, dict[str, str], list[str]]] = []
         self.screendumps: list[int] = []
 
+    def probe(self) -> str:
+        from pbv.core import PbvError
+
+        if self.fail:
+            raise PbvError("node shell: ssh exited 255", code="NODE_SHELL_FAIL")
+        return "fake node shell ok"
+
     def qm_set(self, vmid: int, set_: Mapping[str, str], delete: Sequence[str]) -> None:
         from pbv.core import PbvError
 
