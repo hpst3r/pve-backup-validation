@@ -483,7 +483,10 @@ class FakeNodeShell:
         self.qm_calls: list[tuple[int, dict[str, str], list[str]]] = []
         self.screendumps: list[int] = []
         self.unlocks: list[int] = []
-        self.sysctls: dict[str, str] = {"net.ipv6.conf.vmbr99.disable_ipv6": "1"}
+        self.sysctls: dict[str, str] = {
+            "net.ipv6.conf.vmbr99.disable_ipv6": "1",
+            "kernel.hostname": pve.node if pve is not None else "restore01",
+        }
 
     def probe(self) -> str:
         from pbv.core import PbvError

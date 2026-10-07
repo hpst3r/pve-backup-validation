@@ -142,7 +142,7 @@ def latest(tmp_path: Path) -> dict:
 
 
 def test_passthrough_vm_sanitized_via_root_shell_and_script_runs(world):
-    pve, noderun, tmp = world
+    pve, noderun, tmp = world  # noqa: RUF059
     backup(
         pve,
         105,
@@ -185,7 +185,7 @@ def test_passthrough_vm_sanitized_via_root_shell_and_script_runs(world):
 
 
 def test_failing_check_reports_fail_with_screenshot_and_cleans_up(world):
-    pve, noderun, tmp = world
+    pve, noderun, tmp = world  # noqa: RUF059
     backup(pve, 106, {"name": "web02", "memory": "1024", "net0": "virtio=BC:24:11:00:00:02,bridge=vmbr0", "agent": "1"})
     pve.guest_profile[106] = GuestProfile(boot_polls=0, on_exec=lambda argv, d: (3, "inactive\n", ""))
     vms = '[[vm]]\nvmid = 106\nmode = "manual"\n  [[vm.check]]\n  type = "systemd"\n  unit = "nginx"\n'
@@ -199,8 +199,10 @@ def test_failing_check_reports_fail_with_screenshot_and_cleans_up(world):
 
 
 def test_needs_root_without_node_shell(world):
-    pve, noderun, tmp = world
-    backup(pve, 107, {"name": "gpu02", "hostpci0": "host=0000:02:00.0", "net0": "virtio=BC:24:11:00:00:03,bridge=vmbr0"})
+    pve, noderun, tmp = world  # noqa: RUF059
+    backup(
+        pve, 107, {"name": "gpu02", "hostpci0": "host=0000:02:00.0", "net0": "virtio=BC:24:11:00:00:03,bridge=vmbr0"}
+    )
     cfgp = write_config(tmp, "[[vm]]\nvmid = 107\n")
     text = cfgp.read_text().replace('mode = "local"', 'mode = "off"').replace("enabled = true", "enabled = false")
     cfgp.write_text(text)
@@ -211,7 +213,7 @@ def test_needs_root_without_node_shell(world):
 
 
 def test_destroy_failure_exit_3_and_manual_cleanup_line(world, capsys):
-    pve, noderun, tmp = world
+    pve, noderun, tmp = world  # noqa: RUF059
     backup(pve, 108, {"name": "db01", "net0": "virtio=BC:24:11:00:00:04,bridge=vmbr0", "agent": "1"})
     pve.guest_profile[108] = GuestProfile(boot_polls=0)
     pve.destroy_fails.add(900108)
@@ -222,7 +224,7 @@ def test_destroy_failure_exit_3_and_manual_cleanup_line(world, capsys):
 
 
 def test_restore_failure_with_locked_leftover_is_unlocked_and_destroyed(world):
-    pve, noderun, tmp = world
+    pve, noderun, tmp = world  # noqa: RUF059
     backup(pve, 109, {"name": "x", "net0": "virtio=BC:24:11:00:00:05,bridge=vmbr0"})
     pve.restore_fails[109] = "unable to restore: chunk missing"
     rc = cli.main(["-c", str(write_config(tmp, "[[vm]]\nvmid = 109\n")), "run"])

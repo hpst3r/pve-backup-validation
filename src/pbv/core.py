@@ -439,7 +439,7 @@ class NodeShell(Protocol):
     def unlock(self, vmid: int) -> None: ...  # `qm unlock <vmid>`; raises PbvError(code="NODE_SHELL_FAIL")
     def sysctl(
         self, key: str
-    ) -> str: ...  # `sysctl -n <key>` (key ^[a-z0-9_.-]+$); raises PbvError(code="NODE_SHELL_FAIL")
+    def sysctl(self, key: str) -> str: ...  # `sysctl -n <key>` (key ^[a-z0-9_][a-z0-9_.-]*$); raises PbvError(code="NODE_SHELL_FAIL")
     def qm_set(
         self, vmid: int, set_: Mapping[str, str], delete: Sequence[str]
     ) -> None: ...  # raises PbvError(code="NODE_SHELL_FAIL")

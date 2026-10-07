@@ -89,8 +89,14 @@ on the restore node itself; in `ssh` mode it uses
   `ConsoleCapture(shell: NodeShell)` adapts it to `ConsoleCapturer`; `ConsoleCapture.from_config(shell, shot)`
   returns None unless `shot.enabled`.
 - `Runner(..., node_shell: NodeShell | None = None)`; `preflight(api, cfg, node_shell=None)`.
-- Preflight adds a `node_shell` step when mode != off: run `true` (ssh) or
-  check `os.geteuid() == 0` and `shutil.which("qm")` (local).
+- Preflight adds a `node_shell` step when mode != off: `probe()` (ssh: `qm list`;
+  local: euid 0 + `qm` on PATH), then `sysctl kernel.hostname` must equal
+  `target.node` (short name) so the shell provably lands on the restore node.
+  If the isolated bridge's `disable_ipv6` sysctl is not `1`, preflight fails
+  (without node_shell this is a non-fatal WARN step `bridge_ipv6`).
+- KeyboardInterrupt inside a VM is handled like a stop signal (cleanup, then
+  an interrupted report, exit 130). SystemExit and other BaseExceptions run
+  cleanup and then propagate.
 
 ## 2. Lifecycle per VM (sequential; one VM at a time)
 
@@ -408,7 +414,8 @@ artifacts. Log lines are `KEY=value` style like the legacy script
 - A3 The destroy guard refuses a VMID outside the range or without the tag
   (unless this run created it); `SafetyError` is reported, never destroyed.
 - A4 Restore task failure → RESTORE_FAIL, and the partially created locked VM
-  is still cleaned up (skiplock retry); the run continues to the next VM.
+  is still cleaned up (`qm unlock` via node_shell; without node_shell →
+  CLEANUP_FAIL with VM_LOCKED); the run continues to the next VM.
 - A5 A restore timeout calls stop_task and cleans up.
 - A6 Boot timeout → BOOT_TIMEOUT, screenshot attempted, checks skipped,
   cleanup runs.
