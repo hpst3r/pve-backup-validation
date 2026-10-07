@@ -76,8 +76,24 @@ def build_api(cfg: Config):
     return PveClient.from_config(cfg.target)
 
 
-def build_runner(cfg: Config, api, *, notify: bool = True, stop_flag=None, run_id: str | None = None):
-    """Construct the object graph. Factored out so E2E tests can inject a fake api."""
+def build_node_shell(cfg: Config):
+    """NodeShellRunner for root@pam-only operations, or None when node_shell.mode is off."""
+    from pbv.pve import NodeShellRunner
+
+    return NodeShellRunner.from_config(cfg.node_shell, node=cfg.target.node)
+
+
+def build_runner(
+    cfg: Config,
+    api,
+    *,
+    notify: bool = True,
+    stop_flag=None,
+    run_id: str | None = None,
+    node_shell=None,
+    guest_factory=None,
+):
+    """Construct the object graph. Factored out so E2E tests can inject fakes."""
     from dataclasses import replace
 
     from pbv.checks import CheckEngine
@@ -96,15 +112,16 @@ def build_runner(cfg: Config, api, *, notify: bool = True, stop_flag=None, run_i
         )
     should_stop = stop_flag if stop_flag is not None else (lambda: False)
     engine = CheckEngine(cfg.config_dir, cfg.global_checks, should_stop=should_stop)
-    notifiers = build_notifiers(ncfg, run_dir=cfg.run.log_dir / run_id)
-    console = ConsoleCapture.from_config(api, cfg.screenshot)
+    notifiers = build_notifiers(ncfg)
+    console = ConsoleCapture.from_config(node_shell, cfg.screenshot)
     return Runner(
         cfg,
         api,
         engine,
         notifiers,
-        guest_factory=lambda vmid: PveGuestAgent(api, vmid),
+        guest_factory=guest_factory or (lambda vmid: PveGuestAgent(api, vmid)),
         console=console,
+        node_shell=node_shell,
         run_id=run_id,
         should_stop=should_stop,
         stop_flag=stop_flag,
@@ -126,11 +143,17 @@ def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
     from pbv.orchestrator import RunLock, StopFlag, exit_code
 
     api = build_api(cfg)
+    shell = build_node_shell(cfg)
     if args.dry_run:
-        runner = build_runner(cfg, api, notify=False)
+        runner = build_runner(cfg, api, notify=False, node_shell=shell)
         from pbv.orchestrator import preflight
 
-        steps = preflight(api, cfg)
+        try:
+            steps = preflight(api, cfg, node_shell=shell)
+        except PreflightError as exc:
+            _print_steps(exc.steps)
+            print(f"PREFLIGHT FAILED: {exc}")
+            return EXIT_CONFIG
         _print_steps(steps)
         for target, ref in runner.plan(args.vmid):
             if ref is None:
@@ -148,7 +171,7 @@ def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
         with RunLock(cfg.run.lock_file):
             stop.install()
             try:
-                runner = build_runner(cfg, api, notify=not args.no_notify, stop_flag=stop)
+                runner = build_runner(cfg, api, notify=not args.no_notify, stop_flag=stop, node_shell=shell)
                 report = runner.run(args.vmid)
             finally:
                 stop.uninstall()
@@ -158,8 +181,6 @@ def cmd_run(cfg: Config, args: argparse.Namespace) -> int:
             return EXIT_LOCKED
         raise
     _print_summary(report)
-    if report.preflight and report.preflight[-1].error_code == "PREFLIGHT_FAIL":
-        return EXIT_CONFIG
     return exit_code(report, fail_on_warn=cfg.run.fail_on_warn)
 
 
@@ -180,6 +201,8 @@ def _print_summary(report: RunReport) -> None:
         print(f"  {vm.vmid:>6} {vm.name:<24} {vm.status.value.upper():<7}{extra}")
         if not vm.cleanup_ok:
             print(f"         MANUAL CLEANUP REQUIRED: VM {vm.temp_vmid} on {report.target_node}")
+    for e in report.sweep_failures:
+        print(f"  LEFTOVER NOT REMOVED: {e}")
     for e in report.notify_errors:
         print(f"  notify error: {e}")
 
@@ -188,8 +211,9 @@ def cmd_preflight(cfg: Config, args: argparse.Namespace) -> int:
     from pbv.orchestrator import preflight
 
     try:
-        steps = preflight(build_api(cfg), cfg)
+        steps = preflight(build_api(cfg), cfg, node_shell=build_node_shell(cfg))
     except PreflightError as exc:
+        _print_steps(exc.steps)
         print(f"PREFLIGHT FAILED: {exc}")
         return EXIT_CONFIG
     _print_steps(steps)
@@ -234,8 +258,10 @@ def cmd_cleanup(cfg: Config, args: argparse.Namespace) -> int:
             return EXIT_OK
     try:
         with RunLock(cfg.run.lock_file):
-            runner = build_runner(cfg, api, notify=False)
+            runner = build_runner(cfg, api, notify=False, node_shell=build_node_shell(cfg))
             swept = runner.sweep(include_kept=args.include_kept)
+            for f in runner.last_sweep_failures:
+                print(f"failed: {f}")
     except PbvError as exc:
         if exc.code == "LOCKED":
             log.error("another pbv run is in progress (%s)", cfg.run.lock_file)
