@@ -4,6 +4,10 @@
 ``update_vm_config(set, delete)`` call that isolates the VM (network on the
 isolated bridge, no passthrough, no host devices) and makes it bootable on the
 restore node. It performs no I/O and is unit-tested exhaustively.
+
+:func:`split_privileged` then divides that plan into the part an API token
+may apply and the root-only part applied through ``NodeShell.qm_set``
+(SPEC §1a).
 """
 
 from __future__ import annotations
@@ -11,8 +15,12 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 from pbv.config import SanitizeConfig
+
+PRIVILEGED_KEY = re.compile(r"^(?:(?:hostpci|usb|serial|parallel|virtiofs)\d+|args|hookscript)$")
+"""Config keys PVE 9 may restrict to root@pam (mirror of ``pbv.testing.fakes.PRIVILEGED_KEY``)."""
 
 _NET = re.compile(r"net\d+")
 _PASSTHROUGH = re.compile(r"(hostpci|usb|parallel|virtiofs)\d+")
@@ -198,3 +206,63 @@ def sanitize_config(
         notes=[n for _, n in sorted(notes, key=lambda kn: kn[0])],
         warnings=[w for _, w in sorted(warnings, key=lambda kn: kn[0])],
     )
+
+
+class PrivilegedSplit(NamedTuple):
+    """A :class:`SanitizePlan` split into the API part and the root-only ``qm set`` part (SPEC §1a)."""
+
+    api_set: dict[str, str]
+    api_delete: list[str]
+    root_set: dict[str, str]
+    root_delete: list[str]
+
+    @property
+    def root_keys(self) -> list[str]:
+        return sorted({*self.root_set, *self.root_delete})
+
+
+def _host_device(value: str) -> str:
+    """The ``host=`` of a hostpci/usb value (also the positional first option), else ``""``."""
+    for i, part in enumerate(_opts(value)):
+        if part.startswith("host="):
+            return part[len("host=") :]
+        if i == 0 and "=" not in part:
+            return part
+    return ""
+
+
+def _needs_root(key: str, old: str | None, new: str | None) -> bool:
+    """True if a token (never root@pam) cannot change ``key`` from ``old`` to ``new`` (None = absent)."""
+    if not PRIVILEGED_KEY.match(key):
+        return False
+    if _SERIAL.fullmatch(key):
+        return old not in (None, "socket") or new not in (None, "socket")
+    if key.startswith(("hostpci", "usb")):
+        # Mapped devices only need Mapping.Use; USB spice is a plain HWType change.
+        hosts = {_host_device(v) for v in (old, new) if v is not None} - {""}
+        return bool(hosts - ({"spice"} if key.startswith("usb") else set()))
+    return True
+
+
+def split_privileged(plan: SanitizePlan, current_cfg: Mapping[str, str], *, have_root: bool = True) -> PrivilegedSplit:
+    """Split ``plan`` into API keys and root-only keys (SPEC §1a).
+
+    With ``have_root`` (a NodeShell is configured) every key matching
+    :data:`PRIVILEGED_KEY` goes to root, except ``serial*`` that stays a
+    ``socket`` (the API allows it and needs no root shell). Without it, only
+    keys the API is known to refuse go to root: non-mapped ``hostpci``/``usb``
+    (``host=``), real-device serials, ``parallel*``, ``virtiofs*``, ``args``
+    and ``hookscript``; mapped devices are still tried via the API.
+    """
+
+    def root(key: str, new: str | None) -> bool:
+        if have_root and PRIVILEGED_KEY.match(key) and not _SERIAL.fullmatch(key):
+            return True
+        return _needs_root(key, current_cfg.get(key), new)
+
+    out = PrivilegedSplit({}, [], {}, [])
+    for key, value in plan.set.items():
+        (out.root_set if root(key, value) else out.api_set)[key] = value
+    for key in plan.delete:
+        (out.root_delete if root(key, None) else out.api_delete).append(key)
+    return out

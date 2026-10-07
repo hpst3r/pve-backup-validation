@@ -6,19 +6,20 @@ import pytest
 
 from pbv.core import ApiError, PreflightError, Status
 from pbv.orchestrator import PreflightFailure, preflight
-from pbv.testing.fakes import FakePve, FakeStorage
+from pbv.testing.fakes import FakeNodeShell, FakePve, FakeStorage
 
 from .conftest import make_cfg
 
 STEP_NAMES = ["version", "node", "standalone", "bridge", "backup_storage", "target_storage", "temp_range"]
 
 
-def fails_at(pve: FakePve, cfg, step: str, needle: str = "") -> PreflightFailure:
-    with pytest.raises(PreflightFailure) as ei:
-        preflight(pve, cfg)
+def fails_at(pve: FakePve, cfg, step: str, needle: str = "", **kw) -> PreflightError:
+    with pytest.raises(PreflightError) as ei:
+        preflight(pve, cfg, **kw)
     exc = ei.value
-    assert isinstance(exc, PreflightError) and exc.code == "PREFLIGHT_FAIL"
-    assert [s.name for s in exc.steps] == STEP_NAMES[: STEP_NAMES.index(step) + 1]
+    assert exc.code == "PREFLIGHT_FAIL"
+    names = STEP_NAMES if cfg.node_shell.mode == "off" else [*STEP_NAMES[:1], "node_shell", *STEP_NAMES[1:]]
+    assert [s.name for s in exc.steps] == names[: names.index(step) + 1]
     last = exc.steps[-1]
     assert last.status in (Status.FAIL, Status.ERROR) and last.error_code == "PREFLIGHT_FAIL"
     assert all(s.status is Status.PASS for s in exc.steps[:-1])
@@ -162,3 +163,45 @@ def test_api_error_is_preflight_error(tmp_path):
     pve.fail_next["version"] = ApiError("connection refused", status=None)
     exc = fails_at(pve, make_cfg(tmp_path), "version", "connection refused")
     assert exc.steps[-1].status is Status.ERROR
+
+
+# ── SPEC §1a: node_shell step ───────────────────────────────────────────────────
+def test_node_shell_step_after_version_when_enabled(tmp_path):
+    shell = FakeNodeShell()
+    steps = preflight(FakePve(), make_cfg(tmp_path, node_shell={"mode": "local"}), shell)
+    assert [s.name for s in steps] == ["version", "node_shell", *STEP_NAMES[1:]]
+    assert steps[1].status is Status.PASS and steps[1].message == "fake node shell ok"
+
+
+def test_node_shell_not_probed_when_off(tmp_path):
+    class Exploding(FakeNodeShell):
+        def probe(self) -> str:
+            raise AssertionError("must not be probed")
+
+    steps = preflight(FakePve(), make_cfg(tmp_path), node_shell=Exploding())
+    assert "node_shell" not in [s.name for s in steps]
+
+
+def test_node_shell_probe_failure_is_fatal(tmp_path):
+    pve = FakePve()
+    cfg = make_cfg(tmp_path, node_shell={"mode": "ssh", "ssh_host": "restore01"})
+    exc = fails_at(pve, cfg, "node_shell", "ssh exited 255", node_shell=FakeNodeShell(fail=True))
+    assert exc.steps[-1].status is Status.FAIL
+    assert [c[0] for c in pve.calls] == ["version"]  # nothing after the failed step
+
+
+def test_node_shell_configured_but_not_provided(tmp_path):
+    fails_at(FakePve(), make_cfg(tmp_path, node_shell={"mode": "local"}), "node_shell", "configured but not provided")
+
+
+def test_node_shell_without_probe_is_refused(tmp_path):
+    class NoProbe:
+        def qm_set(self, vmid, set_, delete): ...
+        def screendump(self, vmid, dest): ...
+
+    cfg = make_cfg(tmp_path, node_shell={"mode": "local"})
+    fails_at(FakePve(), cfg, "node_shell", "cannot be probed", node_shell=NoProbe())
+
+
+def test_preflight_failure_alias_is_core_error():
+    assert PreflightFailure is PreflightError

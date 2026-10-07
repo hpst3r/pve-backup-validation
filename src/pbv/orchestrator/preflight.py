@@ -1,9 +1,9 @@
 """Preflight safety guards (SPEC §1).
 
 :func:`preflight` runs every guard in order and returns one ``StepResult``
-per guard. The first failing guard raises :class:`PreflightFailure` (a
-:class:`pbv.core.PreflightError`) that carries the steps recorded so far, so
-the caller can put them in the report. Nothing on the node is modified.
+per guard. The first failing guard raises :class:`pbv.core.PreflightError`
+whose ``steps`` holds the steps recorded so far, so the caller can put them in
+the report. Nothing on the node is modified.
 """
 
 from __future__ import annotations
@@ -15,19 +15,15 @@ from collections.abc import Callable
 from typing import Any
 
 from pbv.config import Config
-from pbv.core import ApiError, PreflightError, PveApi, Status, StepResult, utc_now_iso
+from pbv.core import ApiError, NodeShell, PbvError, PreflightError, PveApi, Status, StepResult, utc_now_iso
 
 log = logging.getLogger("pbv.orchestrator")
 
 _IP_FIELDS = ("cidr", "address", "cidr6", "address6", "gateway", "gateway6")
 
 
-class PreflightFailure(PreflightError):
-    """A preflight guard failed; ``steps`` holds every step run so far."""
-
-    def __init__(self, message: str, *, steps: list[StepResult]) -> None:
-        super().__init__(message)
-        self.steps = steps
+PreflightFailure = PreflightError
+"""Deprecated alias (wave 1); catch :class:`pbv.core.PreflightError`."""
 
 
 class _GuardFail(Exception):
@@ -136,7 +132,20 @@ def _temp_range(api: PveApi, cfg: Config) -> str:
     return f"temp VMID range [{base + 100}, {2 * base}) is free of foreign VMs"
 
 
-_GUARDS: tuple[tuple[str, Callable[[PveApi, Config], str]], ...] = (
+def _node_shell(node_shell: NodeShell | None) -> str:
+    if node_shell is None:
+        raise _GuardFail("node_shell configured but not provided")
+    probe = getattr(node_shell, "probe", None)
+    if not callable(probe):
+        raise _GuardFail(f"node shell {type(node_shell).__name__} cannot be probed (no probe())")
+    try:
+        return str(probe())
+    except PbvError as exc:
+        raise _GuardFail(f"node shell unusable: {exc}") from exc
+
+
+_Guard = Callable[[PveApi, Config], str]
+_GUARDS: tuple[tuple[str, _Guard], ...] = (
     ("version", _version),
     ("node", _node),
     ("standalone", _standalone),
@@ -147,10 +156,17 @@ _GUARDS: tuple[tuple[str, Callable[[PveApi, Config], str]], ...] = (
 )
 
 
-def preflight(api: PveApi, cfg: Config) -> list[StepResult]:
-    """Run every guard; raise :class:`PreflightFailure` at the first failure."""
+def preflight(api: PveApi, cfg: Config, node_shell: NodeShell | None = None) -> list[StepResult]:
+    """Run every guard; raise :class:`pbv.core.PreflightError` at the first failure.
+
+    When ``cfg.node_shell.mode`` is not ``off``, a ``node_shell`` step after
+    ``version`` probes ``node_shell`` (SPEC §1a).
+    """
+    guards = list(_GUARDS)
+    if cfg.node_shell.mode != "off":
+        guards.insert(1, ("node_shell", lambda _api, _cfg: _node_shell(node_shell)))
     steps: list[StepResult] = []
-    for name, guard in _GUARDS:
+    for name, guard in guards:
         t0 = time.monotonic()
         started = utc_now_iso()
         status, message = Status.PASS, ""
@@ -173,6 +189,6 @@ def preflight(api: PveApi, cfg: Config) -> list[StepResult]:
         )
         if failed:
             log.error("PREFLIGHT_FAIL step=%s reason=%s", name, message)
-            raise PreflightFailure(f"preflight {name}: {message}", steps=steps)
+            raise PreflightError(f"preflight {name}: {message}", steps=steps)
         log.info("PREFLIGHT_OK step=%s %s", name, message)
     return steps

@@ -23,12 +23,15 @@ from pbv.core import (
     VmResult,
 )
 from pbv.orchestrator import Runner, StopFlag, exit_code
-from pbv.testing.fakes import FakeCheckSuite, FakePve, GuestProfile, RecordingNotifier
+from pbv.testing.fakes import FakeCheckSuite, FakeNodeShell, FakePve, GuestProfile, RecordingNotifier
 
 from .conftest import NOW_CTIME, Env, add_backup, find_calls, names
 
 C1 = CheckSpec(type="command", name="c1", params={"argv": ["true"]})
 C2 = CheckSpec(type="command", name="c2", params={"argv": ["true"]})
+NODE_SHELL: dict[str, Any] = {"node_shell": {"mode": "local"}}
+SHOTS: dict[str, Any] = {"screenshot": {"enabled": True}, **NODE_SHELL}
+SHOTS_ALWAYS: dict[str, Any] = {"screenshot": {"enabled": True, "when": "always"}, **NODE_SHELL}
 
 
 def step(vm: VmResult, name: str) -> StepResult:
@@ -214,7 +217,7 @@ def test_boot_timeout_screenshot_no_checks_cleanup(env: Env):
     add_backup(env.pve, 105)
     env.pve.guest_profile[105] = GuestProfile(never_boots=True)
     env.checks.planned = [C1]
-    cfg = env.cfg(vms=[{"vmid": 105, "boot_timeout_s": 30}], screenshot={"mode": "local"})
+    cfg = env.cfg(vms=[{"vmid": 105, "boot_timeout_s": 30}], **SHOTS)
     report = env.runner(cfg).run()
     vm = report.vms[0]
     assert vm.failure_code == "BOOT_TIMEOUT" and vm.status is Status.FAIL
@@ -235,7 +238,7 @@ def test_boot_fail_when_vm_stops(env: Env):
 
     env.pve = Crashing()
     add_backup(env.pve, 105)
-    vm = env.runner(env.cfg(screenshot={"mode": "local"})).run().vms[0]
+    vm = env.runner(env.cfg(**SHOTS)).run().vms[0]
     assert vm.failure_code == "BOOT_FAIL" and vm.status is Status.FAIL
     assert step(vm, "cleanup").status is Status.PASS
 
@@ -250,14 +253,35 @@ def test_boot_waits_for_agent(env: Env):
 def test_screenshot_capture_failure_is_not_fatal(env: Env):
     add_backup(env.pve, 105)
     env.console.fail = True
-    vm = env.runner(env.cfg(screenshot={"mode": "local", "when": "always"})).run().vms[0]
+    vm = env.runner(env.cfg(**SHOTS_ALWAYS)).run().vms[0]
     assert vm.status is Status.PASS and vm.screenshots == []
     assert step(vm, "screenshot").status is Status.WARN
 
 
+def test_screenshot_disabled_never_uses_console(env: Env):
+    add_backup(env.pve, 105)
+    env.pve.guest_profile[105] = GuestProfile(never_boots=True)
+    vm = env.runner(env.cfg(screenshot={"when": "always"})).run().vms[0]
+    assert vm.failure_code == "BOOT_TIMEOUT" and env.console.captured == []
+    assert "screenshot" not in [s.name for s in vm.steps]
+
+
+def test_screenshot_enabled_without_console_is_skipped(env: Env):
+    add_backup(env.pve, 105)
+    vm = env.runner(env.cfg(**SHOTS_ALWAYS), console=None).run().vms[0]
+    assert vm.status is Status.PASS and vm.screenshots == []
+    assert "screenshot" not in [s.name for s in vm.steps]
+
+
+def test_screenshot_failure_only_skipped_on_pass(env: Env):
+    add_backup(env.pve, 105)
+    vm = env.runner(env.cfg(**SHOTS)).run().vms[0]
+    assert vm.status is Status.PASS and env.console.captured == []
+
+
 def test_screenshot_always_on_pass(env: Env):
     add_backup(env.pve, 105)
-    vm = env.runner(env.cfg(screenshot={"mode": "local", "when": "always"})).run().vms[0]
+    vm = env.runner(env.cfg(**SHOTS_ALWAYS)).run().vms[0]
     assert vm.status is Status.PASS and len(vm.screenshots) == 1
 
 
@@ -341,6 +365,25 @@ def test_interrupt_during_restore_wait_stops_task(env: Env):
     assert len(pve.stopped_tasks) == 1 and 900105 not in pve.vms
 
 
+def test_interrupt_set_by_last_check_is_honoured(env: Env):
+    add_backup(env.pve, 105)
+    flag = {"stop": False}
+
+    class StopInLast(FakeCheckSuite):
+        def run(self, spec, guest, ctx):
+            flag["stop"] = True  # e.g. SIGTERM arrives while the only check runs
+            return super().run(spec, guest, ctx)
+
+    env.checks = StopInLast(planned=[C1])
+    report = env.runner(env.cfg(), should_stop=lambda: flag["stop"]).run()
+    vm = report.vms[0]
+    assert [c.name for c in vm.checks] == ["c1"]
+    assert vm.failure_code == "INTERRUPTED" and step(vm, "checks").error_code == "INTERRUPTED"
+    assert step(vm, "cleanup").status is Status.PASS and 900105 not in env.pve.vms
+    assert "screenshot" not in [s.name for s in vm.steps]
+    assert report.interrupted and exit_code(report) == 130
+
+
 def test_signal_during_cleanup_does_not_abort_cleanup(env: Env):
     stop = StopFlag()
 
@@ -396,12 +439,29 @@ def test_sweep_disabled(env: Env):
     assert report.leftovers_swept == [] and 900200 in env.pve.vms
 
 
-def test_sweep_failure_is_logged_and_run_continues(env: Env):
+def test_sweep_failure_is_reported_and_run_continues_with_exit_3(env: Env):
     add_backup(env.pve, 105)
     env.pve.add_vm(900200, {"name": "left", "tags": "pbv-temp"})
+    env.pve.add_vm(900300, {"name": "left2", "tags": "pbv-temp"})
     env.pve.destroy_fails.add(900200)
-    report = env.runner(env.cfg()).run()
-    assert report.leftovers_swept == [] and report.vms[0].status is Status.PASS
+    r = env.runner(env.cfg())
+    report = r.run()
+    assert report.leftovers_swept == [900300] and report.vms[0].status is Status.PASS
+    (failure,) = report.sweep_failures
+    assert failure.startswith("900200: CLEANUP_FAIL ") and "lvremove failed" in failure
+    assert r.last_sweep_failures == report.sweep_failures
+    assert 900200 in env.pve.vms
+    assert report.status is Status.ERROR and exit_code(report) == 3
+    assert env.notifier.reports[0].sweep_failures == report.sweep_failures
+
+
+def test_manual_sweep_exposes_failures_and_resets_them(env: Env):
+    env.pve.add_vm(900200, {"name": "left", "tags": "pbv-temp"})
+    env.pve.destroy_fails.add(900200)
+    r = env.runner(env.cfg())
+    assert r.sweep() == [] and len(r.last_sweep_failures) == 1
+    env.pve.destroy_fails.clear()
+    assert r.sweep() == [900200] and r.last_sweep_failures == []
 
 
 # ── temp VMID / space / backup steps ────────────────────────────────────────────
@@ -490,10 +550,82 @@ def test_sanitize_403_has_privilege_hint(env: Env):
 
 def test_sanitize_warnings_reported(env: Env):
     add_backup(env.pve, 105, config={"name": "x", "scsi1": "ceph:vm-105-disk-1", "hostpci0": "01:00.0"})
-    vm = env.runner(env.cfg()).run().vms[0]
+    vm = env.runner(env.cfg(**NODE_SHELL)).run().vms[0]
     assert vm.status is Status.PASS
     assert "WARNING: scsi1: disk on missing storage ceph removed" in vm.sanitized
     assert any(s.startswith("hostpci0: removed passthrough") for s in vm.sanitized)
+
+
+def test_host_pci_removed_through_node_shell(env: Env):
+    add_backup(env.pve, 105, config={"name": "gpu", "hostpci0": "host=0000:01:00.0,pcie=1", "serial0": "socket"})
+    assert env.pve.token_is_root is False
+    report = env.runner(env.cfg(**NODE_SHELL)).run()
+    vm = report.vms[0]
+    assert vm.status is Status.PASS and report.status is Status.PASS
+    assert env.node_shell.qm_calls == [(900105, {}, ["hostpci0"])]
+    _mark, api = find_calls(env.pve, "update_vm_config")
+    assert "hostpci0" not in api[1] and "hostpci0" not in api[2] and "serial0" not in api[2]
+    order = names(env.pve.calls)
+    assert order.index("start_vm") > max(i for i, n in enumerate(order) if n == "update_vm_config")
+    assert any(s.startswith("hostpci0: removed passthrough") for s in vm.sanitized)
+    assert step(vm, "boot").status is Status.PASS and step(vm, "cleanup").status is Status.PASS
+
+
+def test_host_pci_without_node_shell_needs_root(env: Env):
+    add_backup(env.pve, 105, config={"name": "gpu", "hostpci0": "host=0000:01:00.0", "usb1": "host=1234:5678"})
+    report = env.runner(env.cfg()).run()
+    vm = report.vms[0]
+    assert vm.status is Status.FAIL and vm.failure_code == "SANITIZE_NEEDS_ROOT"
+    assert vm.failure_message == "needs root@pam for: hostpci0, usb1 — configure [node_shell]"
+    sanitize = step(vm, "sanitize")
+    assert sanitize.status is Status.FAIL and sanitize.error_code == "SANITIZE_NEEDS_ROOT"
+    assert len(find_calls(env.pve, "update_vm_config")) == 1  # only mark; nothing half-applied
+    assert not find_calls(env.pve, "start_vm") and env.node_shell.qm_calls == []
+    assert step(vm, "cleanup").status is Status.PASS and 900105 not in env.pve.vms
+    assert exit_code(report) == 1
+
+
+@pytest.mark.parametrize("token_is_root", [False, True])
+def test_mapped_host_pci_without_node_shell_tries_api(env: Env, token_is_root: bool):
+    add_backup(env.pve, 105, config={"name": "gpu", "hostpci0": "mapping=gpu,pcie=1"})
+    env.pve.token_is_root = token_is_root
+    vm = env.runner(env.cfg()).run().vms[0]
+    assert find_calls(env.pve, "update_vm_config")[-1][2] == ("hostpci0",)
+    if token_is_root:  # stands in for a token with Mapping.Use
+        assert vm.status is Status.PASS
+    else:
+        assert vm.failure_code == "SANITIZE_FAIL" and "need root@pam" in vm.failure_message
+        assert step(vm, "cleanup").status is Status.PASS
+
+
+def test_node_shell_qm_set_failure(env: Env):
+    class QmSetFails(FakeNodeShell):
+        def probe(self) -> str:
+            return "ok"
+
+    add_backup(env.pve, 105, config={"name": "x", "args": "-cpu host"})
+    env.node_shell = QmSetFails(env.pve, fail=True)
+    vm = env.runner(env.cfg(**NODE_SHELL)).run().vms[0]
+    sanitize = step(vm, "sanitize")
+    assert sanitize.status is Status.ERROR and sanitize.error_code == "NODE_SHELL_FAIL"
+    assert vm.status is Status.ERROR and vm.failure_code == "NODE_SHELL_FAIL" and "ssh exited 255" in vm.failure_message
+    assert env.node_shell.qm_calls == [(900105, {}, ["args"])]
+    assert not find_calls(env.pve, "start_vm") and step(vm, "cleanup").status is Status.PASS
+
+
+def test_node_shell_unused_without_root_keys(env: Env):
+    add_backup(env.pve, 105)
+    vm = env.runner(env.cfg(**NODE_SHELL)).run().vms[0]
+    assert vm.status is Status.PASS and env.node_shell.qm_calls == []
+
+
+def test_node_shell_probe_failure_aborts_run(env: Env):
+    add_backup(env.pve, 105)
+    env.node_shell.fail = True
+    report = env.runner(env.cfg(**NODE_SHELL)).run()
+    assert report.vms == [] and report.preflight[-1].name == "node_shell"
+    assert report.preflight[-1].error_code == "PREFLIGHT_FAIL" and exit_code(report) == 2
+    assert not find_calls(env.pve, "restore_vm")
 
 
 def test_mark_failure(env: Env):
@@ -519,7 +651,7 @@ def test_start_task_failure(env: Env):
 
     env.pve = BadStart()
     add_backup(env.pve, 105)
-    vm = env.runner(env.cfg(screenshot={"mode": "local"})).run().vms[0]
+    vm = env.runner(env.cfg(**SHOTS)).run().vms[0]
     assert vm.failure_code == "START_FAIL" and "kvm: -device foo" in vm.failure_message
 
 
@@ -527,7 +659,7 @@ def test_start_task_failure(env: Env):
 def test_critical_check_failure(env: Env):
     add_backup(env.pve, 105)
     env.checks = FakeCheckSuite(planned=[C1, C2], results={"c2": Status.FAIL})
-    report = env.runner(env.cfg(screenshot={"mode": "local"})).run()
+    report = env.runner(env.cfg(**SHOTS)).run()
     vm = report.vms[0]
     assert vm.status is Status.FAIL and vm.failure_code == "CHECKS_FAILED"
     assert "c2" in step(vm, "checks").message and len(vm.screenshots) == 1
@@ -754,6 +886,7 @@ def _vm(status: Status, cleanup_ok: bool = True) -> VmResult:
             2,
         ),
         (_report(), False, 0),
+        (_report(_vm(Status.PASS), sweep_failures=["900200: CLEANUP_FAIL x"]), False, 3),
     ],
 )
 def test_exit_code(report, fail_on_warn, code):
