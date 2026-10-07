@@ -53,7 +53,6 @@ def make_report(vms: list[VmResult], status: Status, **kw: Any) -> RunReport:
 
 
 def test_render_text_reports_sweep_failures() -> None:
-    review_bug("render_text ignores RunReport.sweep_failures (leftover temp VMs still present)")
     report = make_report(
         [make_vm(105)],
         Status.ERROR,
@@ -108,7 +107,6 @@ def redirect_server() -> Iterator[tuple[str, list[tuple[str, str, bytes]]]]:
 def test_ntfy_redirect_does_not_silently_drop_message(
     redirect_server: tuple[str, list[tuple[str, str, bytes]]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    review_bug("default urllib opener turns a 301'd POST into a body-less GET; ntfy reports success")
     for var in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("no_proxy", "*")

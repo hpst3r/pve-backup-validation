@@ -186,6 +186,14 @@ def test_gating_when_and_per_vm() -> None:
     assert len(FakeSMTP.instances) == 1
 
 
+def test_sweep_failure_triggers_failure_mail() -> None:
+    report = make_report([make_vm(1)], status=Status.PASS, sweep_failures=["900777: CLEANUP_FAIL boom"])
+    EmailNotifier(cfg(when=NotifyWhen.FAILURE), smtp_factory=factory()).run_finished(report)
+    (msg,) = FakeSMTP.instances[0].messages
+    assert msg["Subject"] == "[pbv] CLEANUP-FAILED PASS 0/1 VMs on restore01"
+    assert "MANUAL CLEANUP REQUIRED: VM 900777 on restore01 (startup sweep: CLEANUP_FAIL boom)" in msg.get_content()
+
+
 @pytest.mark.parametrize(
     ("fail_at", "exc", "expected"),
     [

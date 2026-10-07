@@ -86,3 +86,36 @@ def test_unexpected_opener_error_is_secret_free(caplog: pytest.LogCaptureFixture
         n.run_finished(make_report([make_vm(1)]))
     assert SECRET not in caplog.text
     assert SECRET not in repr(n)
+
+
+def test_text_truncated_to_4096_utf16_units_with_emoji(http_server: HttpRecorder) -> None:
+    checks = [check(f"command:c{i}", Status.FAIL, "🔥" * 75) for i in range(60)]
+    notifier(http_server).run_finished(make_report([make_vm(1, Status.FAIL, checks=checks)]))
+    text = form(http_server.requests[0].body)["text"]
+    text.encode("utf-8")  # strict: raises on a lone surrogate
+    units = len(text.encode("utf-16-le")) // 2
+    assert 4095 <= units <= 4096 and text.endswith(TRUNCATION_NOTE)
+    assert len(text) < 4096  # code points undercount what Telegram measures
+
+
+def test_per_vm_text_truncated_by_utf16(http_server: HttpRecorder) -> None:
+    checks = [check(f"command:c{i}", Status.FAIL, "😀" * 75) for i in range(60)]
+    report = make_report([make_vm(1, Status.FAIL, checks=checks)])
+    notifier(http_server, per_vm=True).vm_finished(report.vms[0], report)
+    text = form(http_server.requests[0].body)["text"]
+    assert len(text.encode("utf-16-le")) // 2 <= 4096 and text.endswith(TRUNCATION_NOTE)
+
+
+def test_sweep_failure_alerts_loudly(http_server: HttpRecorder) -> None:
+    report = make_report([make_vm(1)], status=Status.PASS, sweep_failures=["900777: CLEANUP_FAIL boom"])
+    notifier(http_server, when=NotifyWhen.FAILURE).run_finished(report)
+    f = form(http_server.requests[0].body)
+    assert "disable_notification" not in f
+    assert "MANUAL CLEANUP REQUIRED: VM 900777 on restore01 (startup sweep: CLEANUP_FAIL boom)" in f["text"]
+
+
+def test_redirect_refused(http_server: HttpRecorder) -> None:
+    http_server.responses = [(302, b"", {"Location": "/elsewhere"})]
+    with pytest.raises(PbvError, match=r"^telegram: HTTP 302 redirect refused; check server URL$"):
+        notifier(http_server).run_finished(make_report([make_vm(1)]))
+    assert [r.method for r in http_server.requests] == ["POST"]

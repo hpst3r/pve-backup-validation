@@ -6,7 +6,14 @@ import pytest
 
 from pbv.core import NotifyWhen, Status
 from pbv.notify import render_subject, render_text, render_vm_subject, render_vm_text, should_send
-from pbv.notify.render import TRUNCATION_NOTE
+from pbv.notify.render import (
+    TRUNCATION_NOTE,
+    cleanup_failed,
+    run_needs_attention,
+    should_send_run,
+    truncate_utf16,
+    utf16_len,
+)
 
 from .conftest import check, make_report, make_vm, step
 
@@ -238,3 +245,55 @@ def test_vm_text_and_subject() -> None:
     assert "[ERROR] db01 — vmid 107" in text
     ok = make_vm(101, name="")
     assert render_vm_subject(ok, report, "[x]") == "[x] PASS vm101 (101) on restore01"
+
+
+def _sweep_report(status: S = S.ERROR, vms: list | None = None):
+    return make_report(
+        vms if vms is not None else [make_vm(105)],
+        status=status,
+        sweep_failures=["900777: CLEANUP_FAIL destroy task failed", "900778: TIMEOUT stop timed out"],
+    )
+
+
+def test_sweep_failures_render_as_manual_cleanup_at_top() -> None:
+    report = _sweep_report(vms=[make_vm(105), make_vm(106, S.FAIL, cleanup_ok=False)])
+    lines = render_text(report).splitlines()
+    assert lines[0] == "pbv run 20261007T020000Z-ab12 on restore01: CLEANUP-FAILED ERROR"
+    manual = [ln for ln in lines if ln.startswith("MANUAL CLEANUP REQUIRED")]
+    assert manual == [
+        "MANUAL CLEANUP REQUIRED: VM 900777 on restore01 (startup sweep: CLEANUP_FAIL destroy task failed)",
+        "MANUAL CLEANUP REQUIRED: VM 900778 on restore01 (startup sweep: TIMEOUT stop timed out)",
+        "MANUAL CLEANUP REQUIRED: VM 900106 (from 106 vm106) on restore01",
+    ]
+    first_block = next(i for i, ln in enumerate(lines) if ln.startswith("["))
+    assert lines.index(manual[-1]) < first_block
+
+
+def test_sweep_failures_mark_subject() -> None:
+    assert render_subject(_sweep_report()) == "[pbv] CLEANUP-FAILED ERROR 0/1 VMs on restore01"
+    assert render_subject(_sweep_report(vms=[])) == "[pbv] CLEANUP-FAILED ERROR 0/0 VMs on restore01"
+
+
+def test_sweep_failure_gating_and_attention() -> None:
+    # Even a PASS-status report must alert on 'failure' when the sweep left VMs behind.
+    report = _sweep_report(status=S.PASS)
+    assert cleanup_failed(report) and run_needs_attention(report)
+    assert should_send_run(NotifyWhen.FAILURE, report)
+    assert not should_send_run(NotifyWhen.NEVER, report)
+    assert not should_send_run(NotifyWhen.FAILURE, make_report([make_vm(1)], status=S.PASS))
+
+
+def test_malformed_sweep_entry_still_rendered() -> None:
+    report = make_report([], status=S.ERROR, sweep_failures=["garbage without separator"])
+    expected = "MANUAL CLEANUP REQUIRED: VM ? on restore01 (startup sweep: garbage without separator)"
+    assert expected in render_text(report)
+
+
+def test_truncate_utf16_never_splits_surrogate_pairs() -> None:
+    assert utf16_len("a😀é") == 4
+    assert truncate_utf16("😀" * 10, 20) == "😀" * 10
+    note = utf16_len(TRUNCATION_NOTE)
+    out = truncate_utf16("😀" * 100, note + 5)  # odd budget: 2 emoji fit (4 units), the 3rd would split
+    assert out == "😀😀" + TRUNCATION_NOTE
+    out.encode("utf-8")  # strict: raises on a lone surrogate
+    assert truncate_utf16("abc", 1) == TRUNCATION_NOTE
