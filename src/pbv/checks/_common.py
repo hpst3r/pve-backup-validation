@@ -32,13 +32,13 @@ class Kind(enum.Enum):
 
     PASS = "pass"  # noqa: S105
     FAIL = "fail"  # check condition not met (FAIL if critical, else WARN); retried
-    WARN = "warn"  # WARN regardless of critical (warn_exit, degraded fallback); retried
+    WARN = "warn"  # WARN regardless of critical (warn_exit, degraded fallback); final, never retried
     SKIP = "skip"  # not applicable (OS mismatch); never retried
     AGENT_ERROR = "agent_error"  # guest agent / API failure; retried (guest may still be booting)
-    ERROR = "error"  # config/setup/internal problem; never retried
+    ERROR = "error"  # config/setup/internal problem or interrupt; ERROR even if non-critical; never retried
 
 
-RETRYABLE = frozenset({Kind.FAIL, Kind.WARN, Kind.AGENT_ERROR})
+RETRYABLE = frozenset({Kind.FAIL, Kind.AGENT_ERROR})
 
 
 @dataclass(frozen=True)

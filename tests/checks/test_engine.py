@@ -452,6 +452,46 @@ def test_interrupted_guest_is_not_retried(engine: CheckEngine, ctx: CheckContext
     assert r.status is Status.ERROR and r.summary.startswith("INTERRUPTED") and r.attempts == 1
 
 
+def test_interrupted_noncritical_check_stays_error(engine: CheckEngine, ctx: CheckContext) -> None:
+    g = FakeGuest()
+
+    def interrupted(argv: Sequence[str], _i: bytes | None) -> ExecResult:
+        raise InterruptedRun("signal received")
+
+    g.when(lambda a: True, interrupted)
+    r = engine.run(spec("command", argv=["x"], critical=False, wait_s=60), g, ctx)
+    assert r.status is Status.ERROR and r.summary.startswith("INTERRUPTED") and r.attempts == 1
+
+
+def test_internal_error_noncritical_check_stays_error(engine: CheckEngine, ctx: CheckContext) -> None:
+    g = FakeGuest()
+
+    def boom(argv: Sequence[str], _i: bytes | None) -> ExecResult:
+        raise ValueError("kaboom")
+
+    g.when(lambda a: True, boom)
+    r = engine.run(spec("command", argv=["x"], critical=False), g, ctx)
+    assert r.status is Status.ERROR and r.summary.startswith("INTERNAL_ERROR")
+
+
+def test_warn_exit_is_final_not_retried(tmp_path: Path, clock: FakeClock, ctx: CheckContext) -> None:
+    engine = CheckEngine(tmp_path, sleep=clock.sleep, clock=clock)
+    g = FakeGuest()
+    g.default = res(1)
+    r = engine.run(spec("command", argv=["probe"], warn_exit=[1], wait_s=30), g, ctx)
+    assert r.status is Status.WARN and r.attempts == 1 and len(g.calls) == 1
+    assert clock.sleeps == []
+
+
+def test_http_no_client_warn_is_not_retried(tmp_path: Path, clock: FakeClock, ctx: CheckContext) -> None:
+    engine = CheckEngine(tmp_path, sleep=clock.sleep, clock=clock)
+    g = FakeGuest()
+    g.when(has("PBV_NOCLIENT"), res(0, "PBV_NOCLIENT\n"))
+    g.when(has("ss -ltn"), res(0, "PBV_TOOL ss\nLISTEN 0 128 *:80 *:*\n"))
+    r = engine.run(spec("http", port=80, wait_s=30), g, ctx)
+    assert r.status is Status.WARN and r.attempts == 1 and clock.sleeps == []
+
+
 def test_unknown_type_is_error(engine: CheckEngine, ctx: CheckContext) -> None:
     from pbv.core import CheckSpec
 

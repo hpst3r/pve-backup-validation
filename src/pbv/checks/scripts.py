@@ -42,6 +42,7 @@ WINDOWS_TMP = "C:\\Windows\\Temp"
 CLEANUP_TIMEOUT_S = 15.0
 HOST_GRACE_S = 5.0
 HOST_ENV_INHERIT = ("PATH", "LANG", "HOME")
+CMD_METACHARS = re.compile(r'[&|<>^%!"()]')  # same set the config loader rejects
 
 RunHost = Callable[..., "subprocess.CompletedProcess[bytes]"]
 
@@ -91,18 +92,43 @@ def _windows_interp_tokens(interpreter: str) -> list[str]:
     return [t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'" else t for t in toks]
 
 
+def is_cmd_script(path: str) -> bool:
+    return path.lower().endswith((".cmd", ".bat"))
+
+
+def cmd_quote(arg: str) -> str:
+    """Double-quote an argument for cmd.exe if it is empty or contains whitespace.
+
+    cmd.exe metacharacters (including ``"``) are rejected by the config loader
+    and again by :func:`check_script`, so the quotes cannot be broken out of.
+    """
+    return f'"{arg}"' if not arg or re.search(r"\s", arg) else arg
+
+
 def windows_script_argv(dest: str, interpreter: str, args: Sequence[str], env: Mapping[str, str]) -> list[str]:
-    """PowerShell wrapper: ``$env:K='V'; & <interpreter> '<dest>' 'arg'…; exit $LASTEXITCODE``."""
+    """PowerShell wrapper around ``& <interpreter> '<dest>' 'arg'…``.
+
+    A call that fails inside PowerShell (interpreter not found) is caught and
+    exits 1; ``$LASTEXITCODE`` still being ``$null`` (nothing native ran) also
+    exits 1, so the wrapper can never report success by accident.
+    ``$ErrorActionPreference = 'Stop'`` is deliberately not set: Windows
+    PowerShell 5.1 turns native stderr lines into terminating errors under it.
+    """
     sets = "".join(f"$env:{k} = {ps_quote(v)}; " for k, v in env.items())
-    qargs = " ".join(ps_quote(str(a)) for a in args)
     if interpreter.strip():
         toks = _windows_interp_tokens(interpreter)
         call = " ".join(ps_quote(t) for t in toks) + f" {ps_quote(dest)}"
-    elif dest.lower().endswith((".cmd", ".bat")):
+    elif is_cmd_script(dest):
         call = f"cmd.exe /c {ps_quote(dest)}"
+        args = [cmd_quote(str(a)) for a in args]
     else:
         call = " ".join(POWERSHELL) + f" -File {ps_quote(dest)}"
-    return ps_argv(f"{sets}& {call}{' ' + qargs if qargs else ''}; exit $LASTEXITCODE")
+    qargs = " ".join(ps_quote(str(a)) for a in args)
+    return ps_argv(
+        f"{sets}try {{ & {call}{' ' + qargs if qargs else ''} }} "
+        "catch { Write-Output $_.Exception.Message; exit 1 }; "
+        "if ($null -eq $LASTEXITCODE) { exit 1 }; exit $LASTEXITCODE"
+    )
 
 
 def cleanup_argv(os_family: OsFamily, dest: str) -> list[str]:
@@ -131,6 +157,12 @@ def check_script(att: Attempt, *, n: int, config_dir: Path) -> Outcome:
     interpreter = str(p.get("interpreter") or "")
     dest = guest_script_path(os_family, att.ctx.run_id, n, src.name, interpreter)
     args = [str(a) for a in p.get("args") or []]
+    if os_family is OsFamily.WINDOWS and not interpreter.strip() and is_cmd_script(dest):
+        bad_args = [a for a in args if CMD_METACHARS.search(a)]
+        if bad_args:
+            return Outcome(
+                Kind.ERROR, f"cmd.exe metacharacters are not allowed in .cmd/.bat arguments: {bad_args[0]!r}"
+            )
     if os_family is OsFamily.WINDOWS:
         argv = windows_script_argv(dest, interpreter, args, env)
     else:
@@ -165,6 +197,29 @@ def _group_alive(pgid: int) -> bool:
     except (ProcessLookupError, PermissionError):
         return False
     return True
+
+
+def _drain_after_kill(proc: subprocess.Popen[bytes], grace_s: float) -> tuple[bytes | None, bytes | None]:
+    """Collect output after the group was killed, bounded by ``grace_s``.
+
+    A grandchild that left the session (``setsid``) can still hold the pipes
+    open; then the partial output is returned, the pipes are closed and the
+    (already killed) direct child is reaped.
+    """
+    try:
+        return proc.communicate(timeout=grace_s)
+    except subprocess.TimeoutExpired as exc:
+        log.debug("HOST_SCRIPT_PIPES_HELD pid=%d: an escaped descendant keeps stdout/stderr open", proc.pid)
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is not None:
+                with contextlib.suppress(OSError):
+                    pipe.close()
+        proc.wait()
+        return _as_bytes(exc.output), _as_bytes(exc.stderr)
+
+
+def _as_bytes(b: bytes | str | None) -> bytes | None:
+    return b.encode() if isinstance(b, str) else b
 
 
 def default_run_host(
@@ -205,7 +260,7 @@ def default_run_host(
         if _group_alive(pgid):
             log.debug("HOST_SCRIPT_SIGKILL pgid=%d", pgid)
             _killpg(pgid, signal.SIGKILL)
-        out, err = got if got is not None else proc.communicate()
+        out, err = got if got is not None else _drain_after_kill(proc, grace_s)
         raise subprocess.TimeoutExpired(list(argv), timeout_s, output=out, stderr=err) from None
     return subprocess.CompletedProcess(list(argv), proc.returncode, out, err)
 

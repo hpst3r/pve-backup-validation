@@ -4,7 +4,8 @@
 bounded by ``spec.timeout_s``; a failing (or agent-erroring) check is retried
 every ``retry_interval_s`` until ``spec.wait_s`` has elapsed. The raw
 :class:`~pbv.checks._common.Outcome` of the last attempt is mapped to a
-:class:`~pbv.core.Status` using ``spec.critical``.
+:class:`~pbv.core.Status` using ``spec.critical`` (check failures and agent
+errors only: internal errors and interrupts are always ERROR).
 """
 
 from __future__ import annotations
@@ -207,8 +208,10 @@ class CheckEngine:
             status = Status.WARN
         elif k is Kind.FAIL:
             status = Status.FAIL if spec.critical else Status.WARN
-        else:  # AGENT_ERROR / ERROR
+        elif k is Kind.AGENT_ERROR:
             status = Status.ERROR if spec.critical else Status.WARN
+        else:  # ERROR (config/internal problem, InterruptedRun) is never downgraded
+            status = Status.ERROR
         return CheckResult(
             name=spec.name,
             type=spec.type,
