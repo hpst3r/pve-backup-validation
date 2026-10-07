@@ -246,9 +246,17 @@ def cmd_list_backups(cfg: Config, args: argparse.Namespace) -> int:
 
 
 def cmd_cleanup(cfg: Config, args: argparse.Namespace) -> int:
-    from pbv.orchestrator import RunLock
+    from pbv.orchestrator import RunLock, StopFlag, preflight
 
     api = build_api(cfg)
+    shell = build_node_shell(cfg)
+    # Same identity guards as a run (node, standalone, bridge, ...) before destroying anything.
+    try:
+        preflight(api, cfg, node_shell=shell)
+    except PreflightError as exc:
+        _print_steps(exc.steps)
+        print(f"PREFLIGHT FAILED: {exc}")
+        return EXIT_CONFIG
     if not args.yes:
         if not sys.stdin.isatty():
             print("refusing to clean up non-interactively without --yes", file=sys.stderr)
@@ -256,23 +264,37 @@ def cmd_cleanup(cfg: Config, args: argparse.Namespace) -> int:
         ans = input(f"Destroy pbv temporary VMs on {cfg.target.node}? [y/N] ")
         if ans.strip().lower() not in ("y", "yes"):
             return EXIT_OK
+    stop = StopFlag()
     try:
         with RunLock(cfg.run.lock_file):
-            runner = build_runner(cfg, api, notify=False, node_shell=build_node_shell(cfg))
-            swept = runner.sweep(include_kept=args.include_kept)
-            for f in runner.last_sweep_failures:
-                print(f"failed: {f}")
+            runner = build_runner(cfg, api, notify=False, node_shell=shell, stop_flag=stop)
+            stop.install()
+            stop.in_cleanup = True  # Ctrl-C must not abort a destroy midway (SPEC §4)
+            try:
+                swept = runner.sweep(include_kept=args.include_kept)
+            finally:
+                stop.uninstall()
+            failures = list(runner.last_sweep_failures)
     except PbvError as exc:
         if exc.code == "LOCKED":
             log.error("another pbv run is in progress (%s)", cfg.run.lock_file)
             return EXIT_LOCKED
         raise
     print(f"destroyed: {', '.join(map(str, swept)) or 'nothing'}")
-    remaining = [v["vmid"] for v in api.list_vms() if cfg.is_temp_vmid(int(v["vmid"]))]
-    if remaining:
-        print(f"still present in temp range: {', '.join(map(str, remaining))}")
-        return EXIT_CLEANUP
-    return EXIT_OK
+    for f in failures:
+        print(f"FAILED to remove: {f}")
+    from pbv.orchestrator import KEEP_TAG, parse_tags
+
+    for v in api.list_vms():
+        vmid = int(v["vmid"])
+        if not cfg.is_temp_vmid(vmid) or vmid in swept:
+            continue
+        tags = parse_tags(str(v.get("tags", "")))
+        if KEEP_TAG in tags:
+            print(f"kept (use --include-kept): {vmid}")
+        elif cfg.restore.tag not in tags:
+            print(f"not pbv-tagged, left alone: {vmid}")
+    return EXIT_CLEANUP if failures else EXIT_OK
 
 
 def cmd_check_config(cfg: Config, args: argparse.Namespace) -> int:
@@ -281,7 +303,8 @@ def cmd_check_config(cfg: Config, args: argparse.Namespace) -> int:
     print(
         f"config OK: {cfg.path}\n  target {cfg.target.node} ({cfg.target.host}:{cfg.target.port})\n"
         f"  {len(cfg.vms)} VM(s), {n_checks} VM check(s), {len(cfg.global_checks)} global check(s)\n"
-        f"  selection={cfg.run.selection} notifiers={','.join(enabled) or 'none'} screenshots={cfg.screenshot.mode}"
+        f"  selection={cfg.run.selection} notifiers={','.join(enabled) or 'none'} "
+        f"node_shell={cfg.node_shell.mode} screenshots={'on' if cfg.screenshot.enabled else 'off'}"
     )
     return EXIT_OK
 
