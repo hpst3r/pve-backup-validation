@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from pbv.core import BackupRef, CheckResult, RunReport, Status, StepResult, VmResult
+from pbv.notify import http as notify_http
 
 T0 = "2026-10-07T02:00:00Z"
 T0_EPOCH = int(datetime(2026, 10, 7, 2, 0, 0, tzinfo=UTC).timestamp())
@@ -77,11 +78,11 @@ class HttpRecorder:
 
     url: str = ""
     requests: list[Recorded] = field(default_factory=list)
-    responses: list[tuple[int, bytes]] = field(default_factory=list)  # consumed in order; then 200
+    # (status, body[, extra headers]) consumed in order; then 200
+    responses: list[tuple[Any, ...]] = field(default_factory=list)
 
     def opener(self) -> Any:
-        op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        return lambda req, timeout: op.open(req, timeout=timeout)
+        return notify_http.build_opener(urllib.request.ProxyHandler({}))
 
 
 @pytest.fixture
@@ -93,14 +94,16 @@ def http_server() -> Iterator[HttpRecorder]:
             length = int(self.headers.get("Content-Length") or 0)
             body = self.rfile.read(length)
             rec.requests.append(Recorded(self.command, self.path, dict(self.headers.items()), body))
-            status, payload = rec.responses.pop(0) if rec.responses else (200, b'{"ok":true}')
+            status, payload, *extra = rec.responses.pop(0) if rec.responses else (200, b'{"ok":true}')
             self.send_response(status)
+            for key, value in (extra[0] if extra else {}).items():
+                self.send_header(key, value)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
 
-        do_POST = do_PUT = _handle
+        do_GET = do_POST = do_PUT = _handle
 
         def log_message(self, *args: Any) -> None:
             pass

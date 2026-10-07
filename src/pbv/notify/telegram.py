@@ -11,10 +11,10 @@ from pbv.config import TelegramConfig
 from pbv.core import RunReport, VmResult
 from pbv.notify import http
 from pbv.notify.base import BaseNotifier
-from pbv.notify.render import render_text, render_vm_text, run_needs_attention, truncate, vm_needs_attention
+from pbv.notify.render import render_text, render_vm_text, run_needs_attention, truncate_utf16, vm_needs_attention
 
 API_BASE = "https://api.telegram.org"
-MAX_CHARS = 4096
+MAX_CHARS = 4096  # Telegram counts UTF-16 code units, not code points
 
 
 class TelegramNotifier(BaseNotifier):
@@ -46,10 +46,12 @@ class TelegramNotifier(BaseNotifier):
         return f"TelegramNotifier(chat_id={self.cfg.chat_id!r})"
 
     def _send_run(self, report: RunReport) -> None:
-        self._send_message(render_text(report, max_chars=MAX_CHARS), quiet=not run_needs_attention(report))
+        self._send_message(truncate_utf16(render_text(report), MAX_CHARS), quiet=not run_needs_attention(report))
 
     def _send_vm(self, result: VmResult, report: RunReport) -> None:
-        self._send_message(truncate(render_vm_text(result, report), MAX_CHARS), quiet=not vm_needs_attention(result))
+        self._send_message(
+            truncate_utf16(render_vm_text(result, report), MAX_CHARS), quiet=not vm_needs_attention(result)
+        )
 
     def _send_message(self, text: str, *, quiet: bool) -> None:
         form = {"chat_id": self.cfg.chat_id, "text": text}

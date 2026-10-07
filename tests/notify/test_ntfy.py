@@ -157,3 +157,38 @@ def test_gating(http_server: HttpRecorder) -> None:
 
 def test_repr_has_no_token(http_server: HttpRecorder) -> None:
     assert SECRET not in repr(notifier(http_server, token=SECRET))
+
+
+def test_redirect_refused_not_downgraded_to_get(http_server: HttpRecorder) -> None:
+    http_server.responses = [(301, b"", {"Location": "/moved/pbv-alerts"})]
+    sleeps: list[float] = []
+    with pytest.raises(PbvError) as ei:
+        notifier(http_server, sleeps, token=SECRET).run_finished(make_report([make_vm(1, Status.FAIL)]))
+    assert str(ei.value) == "ntfy: HTTP 301 redirect refused; check server URL"
+    assert ei.value.code == "NOTIFY_FAIL"
+    assert [(r.method, r.path) for r in http_server.requests] == [("POST", "/pbv-alerts")]
+    assert sleeps == []
+
+
+def test_read_timeout_not_retried() -> None:
+    calls: list[int] = []
+
+    def opener(req: Any, timeout: float) -> Any:
+        calls.append(1)
+        raise urllib.error.URLError(TimeoutError("timed out"))
+
+    sleeps: list[float] = []
+    n = NtfyNotifier(cfg("http://127.0.0.1:9"), opener=opener, sleep=sleeps.append)
+    with pytest.raises(PbvError, match=r"^ntfy: connection failed"):
+        n.run_finished(make_report([make_vm(1)]))
+    assert calls == [1] and sleeps == []
+
+
+def test_sweep_failure_is_high_priority(http_server: HttpRecorder) -> None:
+    report = make_report([make_vm(1)], status=Status.PASS, sweep_failures=["900777: CLEANUP_FAIL boom"])
+    n = notifier(http_server, when=NotifyWhen.FAILURE)
+    n.run_finished(report)
+    (req,) = http_server.requests
+    assert req.headers["Title"].startswith("[pbv] CLEANUP-FAILED PASS")
+    assert req.headers["Priority"] == n.cfg.priority_fail
+    assert b"MANUAL CLEANUP REQUIRED: VM 900777 on restore01" in req.body

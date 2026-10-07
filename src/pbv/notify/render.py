@@ -53,8 +53,8 @@ def is_problem(status: Status) -> bool:
 
 
 def cleanup_failed(report: RunReport) -> bool:
-    """True if any VM of the run may have left its temporary VM behind."""
-    return any(not vm.cleanup_ok for vm in report.vms)
+    """True if a temporary VM may have been left behind (by a VM test or the startup sweep)."""
+    return bool(report.sweep_failures) or any(not vm.cleanup_ok for vm in report.vms)
 
 
 def run_needs_attention(report: RunReport) -> bool:
@@ -158,6 +158,14 @@ def manual_cleanup_line(vm: VmResult, node: str) -> str:
     return f"MANUAL CLEANUP REQUIRED: VM {vm.temp_vmid} (from {vm.vmid} {_vm_name(vm)}) on {node}"
 
 
+def sweep_failure_line(entry: str, node: str) -> str:
+    """The ``MANUAL CLEANUP REQUIRED`` line for a ``"<temp vmid>: <code> <message>"`` sweep failure."""
+    vmid, sep, detail = entry.partition(": ")
+    if not sep:
+        vmid, detail = "?", entry
+    return f"MANUAL CLEANUP REQUIRED: VM {vmid.strip()} on {node} (startup sweep: {detail.strip()})"
+
+
 def sort_vms(vms: list[VmResult]) -> list[VmResult]:
     """VMs ordered problems first: cleanup failures, then severity desc, then vmid."""
     return sorted(vms, key=lambda v: (v.cleanup_ok, -v.status.rank, v.vmid))
@@ -202,6 +210,29 @@ def truncate(text: str, max_chars: int | None) -> str:
     return text[:keep] + TRUNCATION_NOTE
 
 
+def utf16_len(text: str) -> int:
+    """Length in UTF-16 code units (how Telegram counts its 4096 limit)."""
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
+
+
+def truncate_utf16(text: str, max_units: int) -> str:
+    """Like :func:`truncate` but measured in UTF-16 code units.
+
+    Cuts only between code points, so a surrogate pair (e.g. an emoji) is
+    never split.
+    """
+    if utf16_len(text) <= max_units:
+        return text
+    budget = max(0, max_units - utf16_len(TRUNCATION_NOTE))
+    used = cut = 0
+    for ch in text:
+        used += 2 if ord(ch) > 0xFFFF else 1
+        if used > budget:
+            break
+        cut += 1
+    return text[:cut] + TRUNCATION_NOTE
+
+
 def render_text(report: RunReport, *, max_chars: int | None = None) -> str:
     """Full plain-text body for a run notification (problems first)."""
     bad = cleanup_failed(report)
@@ -217,7 +248,8 @@ def render_text(report: RunReport, *, max_chars: int | None = None) -> str:
         lines.append("Run was INTERRUPTED; remaining VMs were not tested.")
 
     ordered = sort_vms(report.vms)
-    manual = [manual_cleanup_line(vm, report.target_node) for vm in ordered if not vm.cleanup_ok]
+    manual = [sweep_failure_line(e, report.target_node) for e in report.sweep_failures]
+    manual += [manual_cleanup_line(vm, report.target_node) for vm in ordered if not vm.cleanup_ok]
     if manual:
         lines += ["", *manual]
 
