@@ -142,7 +142,7 @@ def latest(tmp_path: Path) -> dict:
 
 
 def test_passthrough_vm_sanitized_via_root_shell_and_script_runs(world):
-    pve, noderun, tmp = world  # noqa: RUF059
+    pve, noderun, tmp = world
     backup(
         pve,
         105,
@@ -224,7 +224,7 @@ def test_destroy_failure_exit_3_and_manual_cleanup_line(world, capsys):
 
 
 def test_restore_failure_with_locked_leftover_is_unlocked_and_destroyed(world):
-    pve, noderun, tmp = world  # noqa: RUF059
+    pve, noderun, tmp = world
     backup(pve, 109, {"name": "x", "net0": "virtio=BC:24:11:00:00:05,bridge=vmbr0"})
     pve.restore_fails[109] = "unable to restore: chunk missing"
     rc = cli.main(["-c", str(write_config(tmp, "[[vm]]\nvmid = 109\n")), "run"])

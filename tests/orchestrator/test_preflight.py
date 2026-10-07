@@ -282,4 +282,6 @@ def test_node_shell_hostname_mismatch_is_fatal(tmp_path, host):
 
 def test_node_shell_hostname_unreadable_is_fatal(tmp_path):
     cfg = make_cfg(tmp_path, node_shell={"mode": "local"})
-    fails_at(FakePve(), cfg, "node_shell", "kernel/hostname", node_shell=FakeNodeShell())
+    shell = FakeNodeShell()
+    del shell.sysctls["kernel.hostname"]
+    fails_at(FakePve(), cfg, "node_shell", "kernel/hostname", node_shell=shell)
