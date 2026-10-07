@@ -32,8 +32,12 @@ that can reach the restore node's API on port 8006.
      `target.forbid_cluster_names`. Either violation → `PREFLIGHT_FAIL`.
   3. `restore.isolated_bridge` exists on the node and has `type == "bridge"`.
      If `require_isolated_bridge` (default true), it must have no bridge ports
-     (`bridge_ports` empty or `"none"`), no `cidr`/`address`/`cidr6`/`address6`
-     and no `gateway`. This means the bridge cannot route anywhere.
+     (`bridge_ports` empty or `"none"`), no `cidr`/`address`/`cidr6`/`address6`,
+     no `gateway`/`gateway6`, and `method`/`method6` must be absent or
+     `manual` (no DHCP/SLAAC). The bridge then has no routable address. The
+     IPv6 link-local address must be disabled on the node
+     (`net.ipv6.conf.<bridge>.disable_ipv6=1`; the setup script does this). When
+     node_shell is configured, preflight verifies it.
   4. `restore.backup_storage` exists, has `type == "pbs"`, and is active and
      enabled.
   5. `restore.target_storage` exists, is active and enabled, and its
@@ -156,14 +160,17 @@ The `set` and `delete` keys never overlap. Order of `notes` is deterministic
 ## 4. Cleanup guarantees
 
 For a temp VM, guarded by `may_destroy`:
-1. If its status is not `stopped`: `stop_vm` and wait 120 s. If PVE reports
-   a lock and the VM was created by this run, retry with `skiplock=True`.
-2. `destroy_vm` (purge + destroy unreferenced disks) and wait 300 s. Lock
-   handling is the same as in step 1.
-3. Verify: `vm_exists` is False.
-4. Retry steps 1–3 up to 3 times with backoff of 5, 15 and 30 s
+1. If the config has a `lock` (e.g. `create` after an aborted restore) and the
+   VM is ours: `NodeShell.unlock` (`qm unlock`). `skiplock` is root@pam-only
+   (verified in qemu-server), so pbv never sends it via the API. If there is no
+   node_shell, the attempt fails with `VM_LOCKED` ("locked (<lock>); configure
+   [node_shell] or run `qm unlock <id>`").
+2. If its status is not `stopped`: `stop_vm` and wait 120 s.
+3. `destroy_vm` (purge + destroy unreferenced disks) and wait 300 s.
+4. Verify: `vm_exists` is False.
+5. Retry steps 1–4 up to 3 times with backoff of 5, 15 and 30 s
    (`sleep` is injectable for tests).
-5. On final failure: `cleanup_ok=False`, step `cleanup` ERROR
+6. On final failure: `cleanup_ok=False`, step `cleanup` ERROR
    `CLEANUP_FAIL`, run status ERROR, exit code 3. Notifications carry the
    line `MANUAL CLEANUP REQUIRED: VM <id> on <node>`.
 
@@ -324,8 +331,10 @@ VMIDs that are not in the config use `Config.vm_target` defaults. Selection
 plan, but creates nothing and sends nothing.
 
 Exit codes: `0` the run passed (WARN allowed unless `run.fail_on_warn`), `1`
-any VM fail/error, `2` config/preflight error, `3` cleanup failure (takes
-precedence over 1), `4` lock held, `130` interrupted.
+any VM fail/error, `2` config/preflight error, `3` cleanup failure or
+unremoved leftover, `4` lock held, `130` interrupted. Precedence:
+3 > 130 > 2 > 1 > 0 (a leftover VM always surfaces as 3, even on interrupt;
+decided after review).
 
 ## 9. PVE client (`pbv.pve`)
 

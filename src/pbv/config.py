@@ -449,6 +449,12 @@ def parse_check(raw: Any, where: str, *, config_dir: Path, default_timeout: int,
                 re.compile(params[key])
             except re.error as exc:
                 raise ConfigError(f"{where}.{key}: invalid regex: {exc}") from None
+    if ctype == "script" and Path(params["path"]).suffix.lower() in (".cmd", ".bat"):
+        bad = [a for a in params["args"] if re.search(r'[&|<>^%!"()]', a)]
+        if bad:
+            raise ConfigError(
+                f"{where}.args: cmd.exe metacharacters are not allowed in .cmd/.bat arguments: {bad[0]!r}"
+            )
     if ctype in ("script", "host_script"):
         p = _resolve(config_dir, params["path"])
         if not p.is_file():

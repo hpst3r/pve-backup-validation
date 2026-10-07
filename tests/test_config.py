@@ -171,6 +171,15 @@ def test_script_paths_relative_to_config(tmp_path):
     assert cfg.vms[0].checks[0].name == "script:g.sh"
 
 
+def test_cmd_script_args_reject_metacharacters(tmp_path):
+    (tmp_path / "x.cmd").write_text("@echo off\r\n")
+    raw = base(tmp_path, vm=[{"vmid": 105, "check": [{"type": "script", "path": "x.cmd", "args": ["ok", "a&b"]}]}])
+    with pytest.raises(ConfigError, match="metacharacters"):
+        parse_config(raw, tmp_path / "c.toml")
+    raw["vm"][0]["check"][0]["args"] = ["plain", "C:\\path\\ok"]
+    assert parse_config(raw, tmp_path / "c.toml").vms[0].checks[0].params["args"] == ["plain", "C:\\path\\ok"]
+
+
 def test_check_defaults_and_os(tmp_path):
     raw = base(
         tmp_path,

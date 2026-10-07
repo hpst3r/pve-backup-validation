@@ -302,6 +302,8 @@ class FakePve:
 
     def stop_vm(self, vmid: int, *, skiplock: bool = False) -> str:
         self._record("stop_vm", vmid, skiplock)
+        if skiplock and self.token_is_root is False:
+            raise ApiError("skiplock: Only root may use this option.", status=400)
         vm = self._vm(vmid)
         if vm.config.get("lock") and not skiplock:
             raise ApiError(f"VM is locked ({vm.config['lock']})", status=500)
@@ -310,6 +312,8 @@ class FakePve:
 
     def destroy_vm(self, vmid: int, *, skiplock: bool = False) -> str:
         self._record("destroy_vm", vmid, skiplock)
+        if skiplock and self.token_is_root is False:
+            raise ApiError("skiplock: Only root may use this option.", status=400)
         vm = self._vm(vmid)
         if vm.config.get("lock") and not skiplock:
             raise ApiError(f"VM is locked ({vm.config['lock']})", status=500)
@@ -478,6 +482,8 @@ class FakeNodeShell:
         self.probe_fails = probe_fails
         self.qm_calls: list[tuple[int, dict[str, str], list[str]]] = []
         self.screendumps: list[int] = []
+        self.unlocks: list[int] = []
+        self.sysctls: dict[str, str] = {"net.ipv6.conf.vmbr99.disable_ipv6": "1"}
 
     def probe(self) -> str:
         from pbv.core import PbvError
@@ -497,6 +503,24 @@ class FakeNodeShell:
             vm.config.update(set_)
             for k in delete:
                 vm.config.pop(k, None)
+
+    def sysctl(self, key: str) -> str:
+        from pbv.core import PbvError
+
+        if self.fail:
+            raise PbvError("node shell: ssh exited 255", code="NODE_SHELL_FAIL")
+        if key not in self.sysctls:
+            raise PbvError(f"node shell: sysctl: cannot stat /proc/sys/{key.replace('.', '/')}", code="NODE_SHELL_FAIL")
+        return self.sysctls[key]
+
+    def unlock(self, vmid: int) -> None:
+        from pbv.core import PbvError
+
+        self.unlocks.append(vmid)
+        if self.fail:
+            raise PbvError("node shell: ssh exited 255", code="NODE_SHELL_FAIL")
+        if self.pve is not None:
+            self.pve._vm(vmid).config.pop("lock", None)
 
     def screendump(self, vmid: int, dest: Path) -> Path | None:
         self.screendumps.append(vmid)
