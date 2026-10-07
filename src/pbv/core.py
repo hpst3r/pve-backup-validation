@@ -177,7 +177,7 @@ class BackupRef:
 @dataclass(frozen=True)
 class TaskResult:
     upid: str
-    exitstatus: str  # "OK" on success
+    exitstatus: str  # "OK" on success; "WARNINGS: n" also counts as ok
     ok: bool
     log_tail: tuple[str, ...] = ()
 

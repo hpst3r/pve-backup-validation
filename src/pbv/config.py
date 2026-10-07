@@ -20,7 +20,7 @@ from typing import Any, Mapping
 from pbv.core import CheckSpec, ConfigError, NotifyWhen, OsFamily, VmTarget
 
 MAX_VMID = 999_999_999
-MAX_SCRIPT_BYTES = 60_000  # PVE agent file-write / input-data limit is ~64 KiB
+MAX_SCRIPT_BYTES = 46_080  # PVE file-write content maxLength 61440 applies to our base64 text (3/4 of it raw)
 MODES = ("auto", "hybrid", "manual")
 
 # ──────────────────────────────────────────────────────────────────────────────

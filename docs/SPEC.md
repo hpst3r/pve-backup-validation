@@ -274,7 +274,7 @@ with snapshot-style asserts).
   `text/plain` UTF-8; screenshots (PNG) attached when `attach_screenshots`,
   at most 5 and 10 MiB total. The `SMTP` factory is injectable for tests.
 - **ntfy**: `POST {server}/{topic}` with headers `Title`, `Priority`
-  (`priority_ok`/`priority_fail`), `Tags`, `Markdown: yes`, optional `Click`,
+  (`priority_ok`/`priority_fail`), `Tags` (no Markdown header: the body is plain text), optional `Click`,
   and `Authorization: Bearer <token>`. The body is the rendered text,
   ≤ 4 KiB (truncated, with a note). When `attach_screenshots`, each PNG is
   sent with `PUT {server}/{topic}` with `Filename` (at most 3). Uses
@@ -345,7 +345,8 @@ opener=None)` implements `PveApi`.
   requests are never retried after a send, to avoid double restore/start.
 - `wait_task`: poll `GET /nodes/{n}/tasks/{upid}/status` every 2 s until
   `status == stopped`. On a non-OK `exitstatus`, include the last 20 lines of
-  `/tasks/{upid}/log` in `TaskResult.log_tail`. Timeout raises
+  `/tasks/{upid}/log` in `TaskResult.log_tail`. `ok` is True for `OK` and
+  `WARNINGS: n` (decided at integration). Timeout raises
   `PbvTimeoutError`. `wait_task` does not raise `TaskFailedError` itself;
   callers inspect `ok`.
 - Guest agent: `agent/ping` returns False on HTTP 500 "not running"/"No QEMU
@@ -353,8 +354,9 @@ opener=None)` implements `PveApi`.
   `input-data`) and returns the pid. `agent/exec-status` base64-decodes
   `out-data`/`err-data` when PVE returns them encoded (PVE already decodes;
   accept both, invalid base64 → raw text). `agent/file-write`: the content is
-  base64-encoded by us with `encode=0`, and content > 60000 bytes →
-  `GuestAgentError`.
+  base64-encoded by us with `encode=0`. PVE's maxLength of 61440 applies to the
+  encoded text, so raw content > 46080 bytes → `GuestAgentError`. The config
+  loader enforces the same limit.
 - `PveGuestAgent(api, vmid, *, sleep, clock, poll_s=1.0)` implements
   `GuestAgent`: `exec` polls exec-status until exited or `timeout_s`, and
   returns `ExecResult(timed_out=True, exitcode=None)` on timeout. `os_family`
